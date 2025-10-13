@@ -19,16 +19,9 @@ LOG="/var/log/a_sh_install.log"
 USER_NAME="${USER_NAME:-lt4c}"
 USER_PASS="${USER_PASS:-lt4c@2025}"
 VNC_PASS="${VNC_PASS:-lt4c}"
-GEOM="${GEOM:-1920x1080}"
+GEOM="${GEOM:-1280x720}"
 VNC_PORT="${VNC_PORT:-5900}"
 SUN_HTTP_TLS_PORT="${SUN_HTTP_TLS_PORT:-47990}"
-
-# Multi-session configuration
-MAX_SESSIONS="${MAX_SESSIONS:-5}"
-ENABLE_MULTI_SESSION="${ENABLE_MULTI_SESSION:-true}"
-
-# NVIDIA Tesla T4 optimization flags
-NVIDIA_T4_OPTIMIZATIONS="${NVIDIA_T4_OPTIMIZATIONS:-true}"
 
 ENABLE_VIGEM="${ENABLE_VIGEM:-false}"
 SUN_DEB_URL="${SUN_DEB_URL:-}"
@@ -133,42 +126,13 @@ usermod -aG video,render,audio,input,uinput "$USER_NAME" 2>/dev/null || true
 USER_UID="$(id -u "$USER_NAME")"
 
 # =================== DESKTOP + XRDP + TigerVNC ===================
-step "2/11 Cài KDE Plasma + XRDP + TigerVNC + NVIDIA Tesla T4"
-
-# Install NVIDIA drivers and CUDA for Tesla T4
-if [[ "$NVIDIA_T4_OPTIMIZATIONS" == "true" ]]; then
-  step "2.1/11 Cài NVIDIA Tesla T4 drivers và CUDA"
-  
-  # Add NVIDIA repository
-  apt -y install software-properties-common >>"$LOG" 2>&1 || true
-  add-apt-repository -y ppa:graphics-drivers/ppa >>"$LOG" 2>&1 || true
-  
-  # Install NVIDIA driver (Tesla T4 compatible)
-  apt update >>"$LOG" 2>&1 || true
-  apt -y install nvidia-driver-535 nvidia-utils-535 >>"$LOG" 2>&1 || true
-  
-  # Install CUDA toolkit for Tesla T4
-  wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb -O /tmp/cuda-keyring.deb >>"$LOG" 2>&1 || true
-  dpkg -i /tmp/cuda-keyring.deb >>"$LOG" 2>&1 || true
-  apt update >>"$LOG" 2>&1 || true
-  apt -y install cuda-toolkit-12-2 nvidia-gds >>"$LOG" 2>&1 || true
-  
-  # Install additional NVIDIA libraries for streaming
-  apt -y install libnvidia-encode1 libnvidia-decode1 nvidia-cuda-toolkit >>"$LOG" 2>&1 || true
-  
-  # Configure NVIDIA persistence daemon
-  systemctl enable nvidia-persistenced >>"$LOG" 2>&1 || true
-  
-  echo "[INFO] NVIDIA Tesla T4 drivers installed. Reboot may be required." >>"$LOG"
-fi
-
+step "2/11 Cài KDE Plasma + XRDP + TigerVNC"
 apt -y install \
   kde-standard sddm xorg \
   xrdp xorgxrdp pulseaudio \
   tigervnc-standalone-server \
   remmina remmina-plugin-rdp remmina-plugin-vnc flatpak \
-  mesa-vulkan-drivers libgl1-mesa-dri libasound2 libpulse0 libxkbcommon0 \
-  vainfo vdpauinfo nvidia-vaapi-driver >>"$LOG" 2>&1
+  mesa-vulkan-drivers libgl1-mesa-dri libasound2 libpulse0 libxkbcommon0 >>"$LOG" 2>&1
 
 # Ensure xrdp is enabled and uses our startwm (Plasma session)
 systemctl enable --now xrdp >>"$LOG" 2>&1 || true
@@ -319,57 +283,7 @@ EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/xstartup"
 chmod +x "/home/$USER_NAME/.vnc/xstartup"
 
-# Create multi-session VNC configuration
-if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
-  # Create VNC service template for multiple sessions
-  cat >/etc/systemd/system/vncserver@.service <<EOF
-[Unit]
-Description=TigerVNC server on display :%i (user ${USER_NAME})
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=simple
-User=${USER_NAME}
-Group=${USER_NAME}
-WorkingDirectory=/home/${USER_NAME}
-Environment=HOME=/home/${USER_NAME}
-Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
-Environment=DISPLAY=:%i
-ExecStartPre=/bin/bash -c 'rm -f /tmp/.X%i-lock /tmp/.X11-unix/X%i'
-ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} -AlwaysShared -AcceptKeyEvents -AcceptPointerEvents -AcceptCutText -SendCutText -SecurityTypes None :%i
-ExecStop=/usr/bin/vncserver -kill :%i
-ExecStopPost=/bin/bash -c 'rm -f /tmp/.X%i-lock /tmp/.X11-unix/X%i'
-Restart=always
-RestartSec=3
-KillMode=mixed
-KillSignal=SIGTERM
-TimeoutStopSec=10
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  # Create multi-session startup script
-  cat >/usr/local/bin/start-multi-vnc.sh <<EOF
-#!/bin/bash
-# Start multiple VNC sessions
-
-echo "[INFO] Starting \$MAX_SESSIONS VNC sessions..."
-
-for i in \$(seq 0 \$((MAX_SESSIONS-1))); do
-    echo "[INFO] Starting VNC session :\$i on port \$((5900+i))"
-    systemctl enable vncserver@\$i.service
-    systemctl start vncserver@\$i.service
-    sleep 2
-done
-
-echo "[INFO] VNC sessions started:"
-systemctl list-units --type=service --state=running | grep vncserver@ || echo "No VNC sessions running"
-EOF
-  chmod +x /usr/local/bin/start-multi-vnc.sh
-
-else
-  # Single session VNC (original configuration)
-  cat >/etc/systemd/system/vncserver@.service <<EOF
+cat >/etc/systemd/system/vncserver@.service <<EOF
 [Unit]
 Description=TigerVNC server on display :%i (user ${USER_NAME})
 After=network-online.target
@@ -393,7 +307,6 @@ TimeoutStopSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
-fi
 
 # Create cleanup service for stale VNC/RDP sessions
 cat >/etc/systemd/system/vnc-rdp-cleanup.service <<EOF
@@ -440,17 +353,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now vnc-rdp-cleanup.timer >>"$LOG" 2>&1 || true
-
-# Start VNC sessions based on configuration
-if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
-  echo "[INFO] Starting $MAX_SESSIONS VNC sessions..." >>"$LOG"
-  for i in $(seq 0 $((MAX_SESSIONS-1))); do
-    systemctl enable --now vncserver@$i.service >>"$LOG" 2>&1 || true
-    sleep 1
-  done
-else
-  systemctl enable --now vncserver@0.service >>"$LOG" 2>&1 || true
-fi
+systemctl enable --now vncserver@0.service >>"$LOG" 2>&1 || true
 
 # Create VNC/RDP reconnection helper script
 cat >/usr/local/bin/vnc-rdp-reconnect.sh <<'EOF'
@@ -595,116 +498,6 @@ if ! dpkg -i "$TMP_DEB"; then
   dpkg -i "$TMP_DEB"
 fi
 rm -f "$TMP_DEB"
-
-# Configure Sunshine for NVIDIA Tesla T4 and multi-session support
-step "6.1.0/11 Cấu hình Sunshine cho NVIDIA Tesla T4 và multi-session"
-
-# Create Sunshine configuration directory
-SUNSHINE_CONFIG_DIR="/home/$USER_NAME/.config/sunshine"
-mkdir -p "$SUNSHINE_CONFIG_DIR"
-chown "$USER_NAME:$USER_NAME" "$SUNSHINE_CONFIG_DIR"
-
-# Create optimized Sunshine configuration for Tesla T4
-cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
-# Sunshine configuration optimized for NVIDIA Tesla T4 and multi-session
-
-# Network configuration
-address_family = both
-bind_address = 0.0.0.0
-port = 47989
-https_port = 47990
-ping_timeout = 30000
-
-# NVIDIA Tesla T4 hardware encoding configuration
-capture = nvfbc
-encoder = nvenc
-adapter_name = /dev/dri/card0
-
-# NVENC settings for Tesla T4
-nvenc_preset = p4
-nvenc_rc = cbr_hq
-nvenc_coder = h264
-nvenc_2pass = enabled
-
-# Video quality settings optimized for Tesla T4
-min_log_level = info
-channels = 5
-fec_percentage = 20
-qp = 28
-
-# Multi-session support
-upnp = disabled
-lan_encryption_mode = 1
-
-# Audio configuration
-audio_sink = pulse
-
-# Performance optimizations for Tesla T4
-sw_preset = ultrafast
-sw_tune = zerolatency
-
-# Display configuration
-output_name = 0
-EOF
-
-# Create Tesla T4 specific environment setup
-if [[ "$NVIDIA_T4_OPTIMIZATIONS" == "true" ]]; then
-  cat >> "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
-
-# Tesla T4 specific optimizations
-nvenc_spatial_aq = enabled
-nvenc_temporal_aq = enabled
-nvenc_realtime = enabled
-nvenc_multipass = qres
-nvenc_coder = auto
-
-# GPU memory and performance settings
-capture_cursor = enabled
-capture_display = auto
-EOF
-fi
-
-chown "$USER_NAME:$USER_NAME" "$SUNSHINE_CONFIG_DIR/sunshine.conf"
-
-# Create multi-session Sunshine launcher
-if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
-  cat > /usr/local/bin/sunshine-multi-session.sh <<EOF
-#!/bin/bash
-# Multi-session Sunshine launcher for Tesla T4
-
-echo "[INFO] Starting Sunshine multi-session support..."
-
-# Create session-specific configurations
-for i in \$(seq 0 \$((MAX_SESSIONS-1))); do
-    SESSION_DIR="/home/$USER_NAME/.config/sunshine-session-\$i"
-    mkdir -p "\$SESSION_DIR"
-    
-    # Copy base configuration
-    cp "$SUNSHINE_CONFIG_DIR/sunshine.conf" "\$SESSION_DIR/sunshine.conf"
-    
-    # Modify ports for each session
-    sed -i "s/port = 47989/port = \$((47989+i))/" "\$SESSION_DIR/sunshine.conf"
-    sed -i "s/https_port = 47990/https_port = \$((47990+i))/" "\$SESSION_DIR/sunshine.conf"
-    
-    # Set display for each session
-    sed -i "s/output_name = 0/output_name = \$i/" "\$SESSION_DIR/sunshine.conf"
-    
-    chown -R "$USER_NAME:$USER_NAME" "\$SESSION_DIR"
-    
-    echo "[INFO] Created Sunshine configuration for session \$i (ports \$((47989+i))/\$((47990+i)))"
-done
-
-echo "[INFO] Multi-session Sunshine configurations created"
-echo "[INFO] Sessions available on ports:"
-for i in \$(seq 0 \$((MAX_SESSIONS-1))); do
-    echo "  Session \$i: HTTP \$((47989+i)), HTTPS \$((47990+i))"
-done
-EOF
-  chmod +x /usr/local/bin/sunshine-multi-session.sh
-  
-  # Run the multi-session setup
-  /usr/local/bin/sunshine-multi-session.sh >>"$LOG" 2>&1 || true
-fi
 
 # Post-installation GLIBCXX verification for Sunshine and user lt4c
 step "6.1.1/11 Kiểm tra GLIBCXX sau khi cài Sunshine cho user ${USER_NAME}"
@@ -1306,47 +1099,11 @@ if [ -z "$IP" ] && command -v hostname >/dev/null 2>&1; then
 fi
 IP="${IP:-<no-ip-detected>}"
 
-if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
-  echo "=== MULTI-SESSION CONFIGURATION ==="
-  echo "VNC Sessions:"
-  for i in $(seq 0 $((MAX_SESSIONS-1))); do
-    echo "  Session $i: ${IP}:$((5900+i))  (pass: ${VNC_PASS})"
-  done
-  echo ""
-  echo "XRDP: ${IP}:3389 (user ${USER_NAME} / ${USER_PASS})"
-  echo ""
-  echo "Sunshine Sessions:"
-  for i in $(seq 0 $((MAX_SESSIONS-1))); do
-    echo "  Session $i: https://${IP}:$((47990+i))"
-  done
-else
-  echo "TigerVNC : ${IP}:${VNC_PORT}  (pass: ${VNC_PASS})"
-  echo "XRDP     : ${IP}:3389        (user ${USER_NAME} / ${USER_PASS})"
-  echo "Sunshine : https://${IP}:${SUN_HTTP_TLS_PORT}  (UI tự ký; auto-add Steam & Chromium)"
-fi
-
+echo "TigerVNC : ${IP}:${VNC_PORT}  (pass: ${VNC_PASS})"
+echo "XRDP     : ${IP}:3389        (user ${USER_NAME} / ${USER_PASS})"
+echo "Sunshine : https://${IP}:${SUN_HTTP_TLS_PORT}  (UI tự ký; auto-add Steam & Chromium)"
 echo "Moonlight: Mở shortcut 'Moonlight (Sunshine Web UI)' trên Desktop để pair"
 echo ""
-
-if [[ "$NVIDIA_T4_OPTIMIZATIONS" == "true" ]]; then
-  echo "=== NVIDIA TESLA T4 OPTIMIZATIONS ==="
-  echo "- Hardware encoding: NVENC enabled"
-  echo "- Capture method: NVFBC (NVIDIA Frame Buffer Capture)"
-  echo "- Preset: P4 (balanced quality/performance)"
-  echo "- Rate control: CBR HQ (Constant Bitrate High Quality)"
-  echo "- Advanced features: Spatial/Temporal AQ, 2-pass encoding"
-  echo "- Check GPU status: nvidia-smi"
-  echo ""
-fi
-
-if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
-  echo "=== MULTI-SESSION MANAGEMENT ==="
-  echo "Start all VNC sessions: /usr/local/bin/start-multi-vnc.sh"
-  echo "Configure Sunshine sessions: /usr/local/bin/sunshine-multi-session.sh"
-  echo "Check VNC sessions: systemctl status 'vncserver@*.service'"
-  echo ""
-fi
-
 echo "=== VNC/RDP RECONNECTION FIXES ==="
 echo "If you can't reconnect after disconnecting VNC/RDP:"
 echo "- Run: /usr/local/bin/vnc-rdp-reconnect.sh"

@@ -76,64 +76,19 @@ else
     echo "[WARN] X11 socket not found: $X11_SOCKET"
 fi
 
-# Install NVIDIA Tesla T4 optimized packages and drivers
-echo "[INFO] Installing NVIDIA Tesla T4 optimized packages and drivers..."
+# Install required packages for GPU and display support
+echo "[INFO] Installing required packages for GPU and display support..."
 apt update >/dev/null 2>&1 || true
+apt install -y mesa-utils mesa-va-drivers mesa-vdpau-drivers vainfo \
+    libva2 libva-drm2 libva-x11-2 libvdpau1 vdpau-driver-all \
+    xserver-xorg-video-all libgl1-mesa-dri libglx-mesa0 \
+    libegl1-mesa libgbm1 libdrm2 >/dev/null 2>&1 || true
 
-# Detect NVIDIA Tesla T4
-NVIDIA_T4_DETECTED=false
-if lspci | grep -i "tesla t4\|t4.*tesla" >/dev/null 2>&1; then
-    NVIDIA_T4_DETECTED=true
-    echo "[INFO] NVIDIA Tesla T4 detected - installing optimized drivers"
-elif nvidia-smi 2>/dev/null | grep -i "tesla t4" >/dev/null 2>&1; then
-    NVIDIA_T4_DETECTED=true
-    echo "[INFO] NVIDIA Tesla T4 detected via nvidia-smi"
-fi
-
-# Install NVIDIA Tesla T4 specific packages
-if [ "$NVIDIA_T4_DETECTED" = true ]; then
-    echo "[INFO] Installing NVIDIA Tesla T4 optimized packages..."
-    
-    # Add NVIDIA repository if not already added
-    if [ ! -f /etc/apt/sources.list.d/graphics-drivers-ubuntu-ppa-*.list ]; then
-        add-apt-repository -y ppa:graphics-drivers/ppa >/dev/null 2>&1 || true
-        apt update >/dev/null 2>&1 || true
-    fi
-    
-    # Install Tesla T4 compatible NVIDIA drivers
-    apt install -y nvidia-driver-535 nvidia-utils-535 nvidia-settings \
-        libnvidia-encode-535 libnvidia-decode-535 nvidia-cuda-toolkit \
-        libnvidia-fbc1-535 libnvidia-ifr1-535 >/dev/null 2>&1 || true
-    
-    # Install CUDA toolkit for Tesla T4
-    if [ ! -f /usr/local/cuda/bin/nvcc ]; then
-        wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb -O /tmp/cuda-keyring.deb >/dev/null 2>&1 || true
-        dpkg -i /tmp/cuda-keyring.deb >/dev/null 2>&1 || true
-        apt update >/dev/null 2>&1 || true
-        apt install -y cuda-toolkit-12-2 >/dev/null 2>&1 || true
-        rm -f /tmp/cuda-keyring.deb
-    fi
-    
-    # Enable NVIDIA persistence daemon for Tesla T4
-    systemctl enable nvidia-persistenced >/dev/null 2>&1 || true
-    systemctl start nvidia-persistenced >/dev/null 2>&1 || true
-    
-    echo "[SUCCESS] NVIDIA Tesla T4 drivers and CUDA installed"
-else
-    echo "[INFO] NVIDIA Tesla T4 not detected, installing generic GPU support..."
-    
-    # Install generic GPU packages
-    apt install -y mesa-utils mesa-va-drivers mesa-vdpau-drivers vainfo \
-        libva2 libva-drm2 libva-x11-2 libvdpau1 vdpau-driver-all \
-        xserver-xorg-video-all libgl1-mesa-dri libglx-mesa0 \
-        libegl1-mesa libgbm1 libdrm2 >/dev/null 2>&1 || true
-    
-    # Install Hyper-V specific drivers if running in Hyper-V
-    if lspci | grep -i "microsoft.*hyper-v" >/dev/null 2>&1; then
-        echo "[INFO] Detected Hyper-V environment, installing specific drivers..."
-        apt install -y xserver-xorg-video-fbdev linux-image-virtual \
-            linux-tools-virtual linux-cloud-tools-virtual >/dev/null 2>&1 || true
-    fi
+# Install Hyper-V specific drivers if running in Hyper-V
+if lspci | grep -i "microsoft.*hyper-v" >/dev/null 2>&1; then
+    echo "[INFO] Detected Hyper-V environment, installing specific drivers..."
+    apt install -y xserver-xorg-video-fbdev linux-image-virtual \
+        linux-tools-virtual linux-cloud-tools-virtual >/dev/null 2>&1 || true
 fi
 
 # Setup comprehensive uinput permissions for Sunshine virtual input devices
@@ -324,68 +279,10 @@ SUNSHINE_CONFIG_DIR="/home/$DESKTOP_USER/.config/sunshine"
 mkdir -p "$SUNSHINE_CONFIG_DIR"
 chown "$DESKTOP_USER:$DESKTOP_USER" "$SUNSHINE_CONFIG_DIR"
 
-# Create Tesla T4 optimized Sunshine configuration
-echo "[INFO] Creating Tesla T4 optimized Sunshine configuration..."
-
-# Create Tesla T4 specific configuration
-if [ "$NVIDIA_T4_DETECTED" = true ]; then
-    cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
-# Sunshine configuration optimized for NVIDIA Tesla T4
-
-# Network and pairing configuration
-address_family = both
-bind_address = 0.0.0.0
-port = 47989
-https_port = 47990
-ping_timeout = 30000
-channels = 5
-
-# Certificate and SSL configuration
-cert = /home/$DESKTOP_USER/.config/sunshine/sunshine.cert
-pkey = /home/$DESKTOP_USER/.config/sunshine/sunshine.key
-
-# NVIDIA Tesla T4 hardware encoding configuration
-capture = nvfbc
-encoder = nvenc
-adapter_name = /dev/dri/card0
-
-# NVENC settings optimized for Tesla T4
-nvenc_preset = p4
-nvenc_rc = cbr_hq
-nvenc_coder = h264
-nvenc_2pass = enabled
-nvenc_spatial_aq = enabled
-nvenc_temporal_aq = enabled
-nvenc_realtime = enabled
-nvenc_multipass = qres
-
-# Video quality settings for Tesla T4
-min_log_level = info
-fec_percentage = 20
-qp = 28
-
-# Audio configuration
-audio_sink = pulse
-
-# Performance optimizations
-capture_cursor = enabled
-capture_display = auto
-
-# Tesla T4 specific display settings
-output_name = 0
-
-# Pairing settings
-pin_timeout = 120000
-
-# Advanced Tesla T4 optimizations
-nvenc_vbv_max_bitrate = 0
-nvenc_lookahead = 8
-nvenc_b_ref_mode = each
-EOF
-else
-    # Fallback configuration for non-Tesla T4 systems
-    cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
-# Sunshine configuration for non-Tesla T4 systems
+# Create Sunshine configuration to fix display and pairing issues
+echo "[INFO] Creating Sunshine configuration to fix display and pairing issues..."
+cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
+# Sunshine configuration to fix display and pairing issues
 
 # Network and pairing configuration
 address_family = both
@@ -419,14 +316,13 @@ log_colorized = enabled
 kms_crtc_id = 0
 kms_connector_id = 31
 
-# Disable problematic features for non-NVIDIA
+# Disable problematic features
 nvenc = disabled
 vaapi = disabled
 
 # Pairing settings
 pin_timeout = 120000
 EOF
-fi
 
 chown "$DESKTOP_USER:$DESKTOP_USER" "$SUNSHINE_CONFIG_DIR/sunshine.conf"
 
@@ -506,13 +402,11 @@ EOF
 
 chmod +x "/usr/local/bin/sunshine-pair.sh"
 
-# Create Tesla T4 optimized X11 wrapper script
-echo "[INFO] Creating Tesla T4 optimized X11 wrapper for Sunshine..."
-
-if [ "$NVIDIA_T4_DETECTED" = true ]; then
-    cat > "/usr/local/bin/sunshine-x11-wrapper.sh" <<'EOF'
+# Create X11 wrapper script to ensure proper display detection
+echo "[INFO] Creating X11 display wrapper for Sunshine..."
+cat > "/usr/local/bin/sunshine-x11-wrapper.sh" <<'EOF'
 #!/bin/bash
-# Tesla T4 optimized X11 wrapper for Sunshine
+# X11 wrapper for Sunshine to ensure proper display detection
 
 # Set up X11 environment
 export DISPLAY="${DISPLAY:-:0}"
@@ -521,56 +415,13 @@ export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
 # Enable X11 forwarding for all users
 xhost +local: 2>/dev/null || true
 
-# NVIDIA Tesla T4 specific environment variables
-export __GL_SYNC_TO_VBLANK=0
-export __GL_SYNC_DISPLAY_DEVICE=DFP-0
-export __GL_SHADER_DISK_CACHE=1
-export __GL_SHADER_DISK_CACHE_PATH=/tmp
-export __GL_THREADED_OPTIMIZATIONS=1
-export __GL_YIELD=USLEEP
-export CUDA_VISIBLE_DEVICES=0
-export NVIDIA_VISIBLE_DEVICES=0
-export NVIDIA_DRIVER_CAPABILITIES=all
-
-# NVENC specific optimizations
-export NVENC_PRESET=p4
-export NVENC_RC_MODE=cbr_hq
-export NVENC_MULTIPASS=qres
-export NVENC_SPATIAL_AQ=1
-export NVENC_TEMPORAL_AQ=1
-
-# Disable software fallbacks when Tesla T4 is available
-unset LIBGL_ALWAYS_SOFTWARE
-unset MESA_LOADER_DRIVER_OVERRIDE
-
-# Ensure NVIDIA libraries are prioritized
-export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
-
-# Start Sunshine with Tesla T4 optimizations
-echo "[INFO] Starting Sunshine with NVIDIA Tesla T4 optimizations"
-exec /usr/bin/sunshine "$@"
-EOF
-else
-    cat > "/usr/local/bin/sunshine-x11-wrapper.sh" <<'EOF'
-#!/bin/bash
-# Generic X11 wrapper for Sunshine (non-Tesla T4)
-
-# Set up X11 environment
-export DISPLAY="${DISPLAY:-:0}"
-export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
-
-# Enable X11 forwarding for all users
-xhost +local: 2>/dev/null || true
-
-# Set up DRI environment for software rendering
+# Set up DRI environment
 export LIBGL_ALWAYS_SOFTWARE=1
 export MESA_LOADER_DRIVER_OVERRIDE=swrast
 
-# Start Sunshine with software rendering
-echo "[INFO] Starting Sunshine with software rendering (no Tesla T4 detected)"
+# Start Sunshine with proper environment
 exec /usr/bin/sunshine "$@"
 EOF
-fi
 
 chmod +x "/usr/local/bin/sunshine-x11-wrapper.sh"
 
@@ -664,10 +515,8 @@ if command -v ufw >/dev/null 2>&1; then
     ufw allow 48100:48200/tcp >/dev/null 2>&1 || true
 fi
 
-# Start Sunshine with Tesla T4 optimized environment
-if [ "$NVIDIA_T4_DETECTED" = true ]; then
-    echo "[INFO] Starting Sunshine with NVIDIA Tesla T4 optimizations..."
-    su - "$DESKTOP_USER" -c "
+# Start Sunshine as the desktop user with comprehensive environment
+su - "$DESKTOP_USER" -c "
 export DISPLAY='$DETECTED_DISPLAY'
 export XDG_RUNTIME_DIR='$DESKTOP_XDG_RUNTIME_DIR'
 export XDG_SESSION_TYPE='x11'
@@ -680,47 +529,7 @@ export SYSTEMD_IGNORE_CHROOT=1
 export NO_AT_BRIDGE=1
 export DBUS_FATAL_WARNINGS=0
 
-# NVIDIA Tesla T4 specific environment
-export __GL_SYNC_TO_VBLANK=0
-export __GL_THREADED_OPTIMIZATIONS=1
-export __GL_SHADER_DISK_CACHE=1
-export CUDA_VISIBLE_DEVICES=0
-export NVIDIA_VISIBLE_DEVICES=0
-export NVIDIA_DRIVER_CAPABILITIES=all
-
-# Hardware acceleration environment
-unset LIBGL_ALWAYS_SOFTWARE
-unset MESA_LOADER_DRIVER_OVERRIDE
-export LIBVA_DRIVER_NAME=nvidia
-export VDPAU_DRIVER=nvidia
-
-# CUDA and NVENC paths
-export PATH='/usr/local/cuda/bin:\$PATH'
-export LD_LIBRARY_PATH='/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH'
-
-# Enable X11 access
-xhost +local: 2>/dev/null || true
-
-# Start Sunshine with Tesla T4 wrapper
-nohup /usr/local/bin/sunshine-x11-wrapper.sh > /tmp/sunshine-direct.log 2>&1 &
-echo \$!
-" > /tmp/sunshine-pid.tmp
-else
-    echo "[INFO] Starting Sunshine with software rendering (no Tesla T4 detected)..."
-    su - "$DESKTOP_USER" -c "
-export DISPLAY='$DETECTED_DISPLAY'
-export XDG_RUNTIME_DIR='$DESKTOP_XDG_RUNTIME_DIR'
-export XDG_SESSION_TYPE='x11'
-export XDG_CURRENT_DESKTOP='KDE'
-export DESKTOP_SESSION='plasma'
-export KDE_FULL_SESSION='true'
-export QT_QPA_PLATFORM='xcb'
-export QT_QPA_PLATFORMTHEME='kde'
-export SYSTEMD_IGNORE_CHROOT=1
-export NO_AT_BRIDGE=1
-export DBUS_FATAL_WARNINGS=0
-
-# Software rendering environment
+# GPU and Mesa environment
 export LIBGL_ALWAYS_SOFTWARE=1
 export MESA_LOADER_DRIVER_OVERRIDE=swrast
 export LIBVA_DRIVER_NAME=
@@ -729,11 +538,10 @@ export VDPAU_DRIVER=
 # Enable X11 access
 xhost +local: 2>/dev/null || true
 
-# Start Sunshine with software rendering wrapper
+# Start Sunshine with the X11 wrapper
 nohup /usr/local/bin/sunshine-x11-wrapper.sh > /tmp/sunshine-direct.log 2>&1 &
 echo \$!
 " > /tmp/sunshine-pid.tmp
-fi
 
 SUNSHINE_PID=$(cat /tmp/sunshine-pid.tmp)
 rm -f /tmp/sunshine-pid.tmp
