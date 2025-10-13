@@ -17,17 +17,7 @@ export APT_LISTCHANGES_FRONTEND=none
 LOG="/var/log/a_sh_install.log"
 
 USER_NAME="${USER_NAME:-lt4c}"
-
-# Generate secure passwords if not provided
-if [ -z "${USER_PASS:-}" ]; then
-    USER_PASS="$(openssl rand -base64 16)"
-    echo "[SECURITY] Generated password for $USER_NAME: $USER_PASS" | tee -a /root/lt4c-credentials.txt
-    chmod 600 /root/lt4c-credentials.txt
-else
-    USER_PASS="${USER_PASS}"
-fi
-
-# Use fixed VNC password (not randomly generated)
+USER_PASS="${USER_PASS:-lt4c@2025}"
 VNC_PASS="${VNC_PASS:-lt4c}"
 
 GEOM="${GEOM:-1920x1080}"
@@ -1443,12 +1433,10 @@ echo "=========================================="
 echo ""
 
 # Display credentials
-echo "=== CREDENTIALS (IMPORTANT - SAVE THESE) ==="
+echo "=== CREDENTIALS ==="
 echo "User: ${USER_NAME}"
 echo "Password: ${USER_PASS}"
 echo "VNC Password: ${VNC_PASS}"
-echo ""
-echo "Credentials saved to: /root/lt4c-credentials.txt"
 echo ""
 
 # Display connection information
@@ -1536,7 +1524,6 @@ done
 echo ""
 
 log INFO "Installation completed successfully"
-log INFO "Credentials saved to /root/lt4c-credentials.txt"
 log INFO "Log file compressed to $LOG.gz"
 
 step "11/11 DONE"
