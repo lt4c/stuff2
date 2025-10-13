@@ -2,56 +2,15 @@
 # Direct Sunshine launcher for RDP testing - sets up permissions then runs as desktop user
 # Usage: sudo ./sunshine_direct.sh
 
-set -euo pipefail
-
-# Logging and error handling
-LOG_FILE="/tmp/sunshine-direct-setup.log"
-: >"$LOG_FILE"
-
-log() {
-    local level=$1
-    shift
-    local message="$*"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE"
-    [ "$level" = "ERROR" ] && echo "$message" >&2
-}
-
-handle_error() {
-    local exit_code=$?
-    local line_no=$1
-    local command="$2"
-    if [ $exit_code -ne 0 ]; then
-        log ERROR "Command failed at line $line_no: $command (exit code: $exit_code)"
-        return $exit_code
-    fi
-    return 0
-}
-
-cleanup_on_exit() {
-    local exit_code=$?
-    log INFO "Cleaning up temporary files..."
-    rm -f /tmp/sunshine-pid.tmp /tmp/cuda-keyring.deb 2>/dev/null || true
-    pkill -f "sunshine-x11-wrapper" 2>/dev/null || true
-    exit $exit_code
-}
-
-trap cleanup_on_exit EXIT INT TERM
-
-log INFO "Direct Sunshine launcher for KDE Plasma streaming"
-
-# Validate system requirements
-if [ "$(id -u)" -ne 0 ]; then
-    log ERROR "This script needs root privileges to set up permissions"
-    log ERROR "Please run: sudo $0"
-    exit 1
-fi
+echo "[INFO] Direct Sunshine launcher for KDE Plasma streaming"
 
 # Detect the desktop user (the user who owns the X session)
 DESKTOP_USER=""
 if [ -n "${SUDO_USER:-}" ]; then
+    # Script was run with sudo, use the original user
     DESKTOP_USER="$SUDO_USER"
 elif [ "$(id -u)" -eq 0 ]; then
+    # Running as root but no SUDO_USER, try to detect desktop user
     for user in lt4c $(users | tr ' ' '\n' | sort -u); do
         if id "$user" >/dev/null 2>&1 && [ "$user" != "root" ]; then
             DESKTOP_USER="$user"
@@ -59,42 +18,43 @@ elif [ "$(id -u)" -eq 0 ]; then
         fi
     done
 else
+    # Not running as root, use current user
     DESKTOP_USER="$(whoami)"
 fi
 
 if [ -z "$DESKTOP_USER" ]; then
-    log ERROR "Cannot detect desktop user. Please run as: sudo -u lt4c $0"
+    echo "[ERROR] Cannot detect desktop user. Please run as: sudo -u lt4c $0"
     exit 1
 fi
 
-log INFO "Desktop user detected: $DESKTOP_USER"
-log INFO "Setting up permissions as root, then switching to $DESKTOP_USER for Sunshine"
+echo "[INFO] Desktop user detected: $DESKTOP_USER"
+echo "[INFO] Setting up permissions as root, then switching to $DESKTOP_USER for Sunshine"
+
+# Ensure we have root privileges for permission setup
+if [ "$(id -u)" -ne 0 ]; then
+    echo "[ERROR] This script needs root privileges to set up permissions"
+    echo "[ERROR] Please run: sudo $0"
+    exit 1
+fi
 
 # Get desktop user's UID for environment setup
-DESKTOP_UID=$(id -u "$DESKTOP_USER") || handle_error $LINENO "get user UID"
-DESKTOP_GID=$(id -g "$DESKTOP_USER") || handle_error $LINENO "get user GID"
+DESKTOP_UID=$(id -u "$DESKTOP_USER")
+DESKTOP_GID=$(id -g "$DESKTOP_USER")
 
-log INFO "Desktop user UID: $DESKTOP_UID, GID: $DESKTOP_GID"
+echo "[INFO] Desktop user UID: $DESKTOP_UID"
 
 # Detect display for the desktop user
-log INFO "Detecting X11 display..."
 DETECTED_DISPLAY=":0"
-DISPLAY_FOUND=false
 for display in /tmp/.X11-unix/X*; do
     if [ -S "$display" ]; then
         display_num="${display##*/X}"
         DETECTED_DISPLAY=":${display_num}"
-        log INFO "Found X11 socket: $display -> $DETECTED_DISPLAY"
-        DISPLAY_FOUND=true
+        echo "[INFO] Found X11 socket: $display -> $DETECTED_DISPLAY"
         break
     fi
 done
 
-if [ "$DISPLAY_FOUND" = false ]; then
-    log WARN "No X11 sockets found, using default :0"
-fi
-
-log INFO "Will stream DISPLAY=$DETECTED_DISPLAY"
+echo "[INFO] Will stream DISPLAY=$DETECTED_DISPLAY"
 
 # Setup environment variables for the desktop user
 DESKTOP_HOME="/home/$DESKTOP_USER"
@@ -117,89 +77,62 @@ else
 fi
 
 # Install NVIDIA Tesla T4 optimized packages and drivers
-log INFO "Checking for NVIDIA Tesla T4 GPU..."
+echo "[INFO] Installing NVIDIA Tesla T4 optimized packages and drivers..."
+apt update >/dev/null 2>&1 || true
 
-# Cache GPU detection to avoid repeated lspci calls
-GPU_CACHE="/tmp/gpu-detection-cache"
-if [ -f "$GPU_CACHE" ] && [ $(($(date +%s) - $(stat -c %Y "$GPU_CACHE" 2>/dev/null || echo 0))) -lt 3600 ]; then
-    NVIDIA_T4_DETECTED=$(cat "$GPU_CACHE")
-    log INFO "Using cached GPU detection result"
-else
-    NVIDIA_T4_DETECTED=false
-    if lspci 2>/dev/null | grep -qi "tesla t4"; then
-        NVIDIA_T4_DETECTED=true
-        log INFO "NVIDIA Tesla T4 detected via lspci"
-    elif nvidia-smi 2>/dev/null | grep -qi "tesla t4"; then
-        NVIDIA_T4_DETECTED=true
-        log INFO "NVIDIA Tesla T4 detected via nvidia-smi"
-    fi
-    echo "$NVIDIA_T4_DETECTED" > "$GPU_CACHE"
+# Detect NVIDIA Tesla T4
+NVIDIA_T4_DETECTED=false
+if lspci | grep -i "tesla t4\|t4.*tesla" >/dev/null 2>&1; then
+    NVIDIA_T4_DETECTED=true
+    echo "[INFO] NVIDIA Tesla T4 detected - installing optimized drivers"
+elif nvidia-smi 2>/dev/null | grep -i "tesla t4" >/dev/null 2>&1; then
+    NVIDIA_T4_DETECTED=true
+    echo "[INFO] NVIDIA Tesla T4 detected via nvidia-smi"
 fi
 
 # Install NVIDIA Tesla T4 specific packages
 if [ "$NVIDIA_T4_DETECTED" = true ]; then
-    log INFO "Installing NVIDIA Tesla T4 optimized packages (this may take several minutes)"
+    echo "[INFO] Installing NVIDIA Tesla T4 optimized packages..."
     
     # Add NVIDIA repository if not already added
     if [ ! -f /etc/apt/sources.list.d/graphics-drivers-ubuntu-ppa-*.list ]; then
-        log INFO "Adding NVIDIA repository"
-        add-apt-repository -y ppa:graphics-drivers/ppa >>"$LOG_FILE" 2>&1 || log WARN "Failed to add NVIDIA PPA"
-        apt update >>"$LOG_FILE" 2>&1 || log WARN "apt update had warnings"
+        add-apt-repository -y ppa:graphics-drivers/ppa >/dev/null 2>&1 || true
+        apt update >/dev/null 2>&1 || true
     fi
     
-    # Install Tesla T4 drivers and libraries in parallel
-    log INFO "Installing NVIDIA drivers and encoding libraries"
+    # Install Tesla T4 compatible NVIDIA drivers
     apt install -y nvidia-driver-535 nvidia-utils-535 nvidia-settings \
-        libnvidia-encode-535 libnvidia-decode-535 \
-        libnvidia-fbc1-535 libnvidia-ifr1-535 >>"$LOG_FILE" 2>&1 &
-    NVIDIA_INSTALL_PID=$!
+        libnvidia-encode-535 libnvidia-decode-535 nvidia-cuda-toolkit \
+        libnvidia-fbc1-535 libnvidia-ifr1-535 >/dev/null 2>&1 || true
     
-    # Download CUDA toolkit while drivers install (only if not already installed)
+    # Install CUDA toolkit for Tesla T4
     if [ ! -f /usr/local/cuda/bin/nvcc ]; then
-        log INFO "Downloading CUDA toolkit"
-        if wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb -O /tmp/cuda-keyring.deb >>"$LOG_FILE" 2>&1; then
-            log INFO "CUDA keyring downloaded successfully"
-        else
-            log WARN "Failed to download CUDA keyring, will skip CUDA installation"
-        fi
-    else
-        log INFO "CUDA toolkit already installed, skipping"
+        wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb -O /tmp/cuda-keyring.deb >/dev/null 2>&1 || true
+        dpkg -i /tmp/cuda-keyring.deb >/dev/null 2>&1 || true
+        apt update >/dev/null 2>&1 || true
+        apt install -y cuda-toolkit-12-2 >/dev/null 2>&1 || true
+        rm -f /tmp/cuda-keyring.deb
     fi
     
-    # Wait for driver installation
-    wait $NVIDIA_INSTALL_PID || log WARN "NVIDIA driver installation had warnings"
+    # Enable NVIDIA persistence daemon for Tesla T4
+    systemctl enable nvidia-persistenced >/dev/null 2>&1 || true
+    systemctl start nvidia-persistenced >/dev/null 2>&1 || true
     
-    # Install CUDA toolkit if downloaded
-    if [ -f /tmp/cuda-keyring.deb ] && [ ! -f /usr/local/cuda/bin/nvcc ]; then
-        log INFO "Installing CUDA toolkit"
-        dpkg -i /tmp/cuda-keyring.deb >>"$LOG_FILE" 2>&1 || log WARN "CUDA keyring installation had warnings"
-        apt update >>"$LOG_FILE" 2>&1 || true
-        apt install -y cuda-toolkit-12-2 >>"$LOG_FILE" 2>&1 || log WARN "CUDA installation had warnings"
-    fi
-    
-    # Enable NVIDIA persistence daemon
-    log INFO "Configuring NVIDIA persistence daemon"
-    if systemctl enable nvidia-persistenced >>"$LOG_FILE" 2>&1 && systemctl start nvidia-persistenced >>"$LOG_FILE" 2>&1; then
-        log INFO "NVIDIA persistence daemon enabled and started"
-    else
-        log WARN "Could not enable NVIDIA persistence daemon"
-    fi
-    
-    log INFO "NVIDIA Tesla T4 drivers installed successfully"
+    echo "[SUCCESS] NVIDIA Tesla T4 drivers and CUDA installed"
 else
-    log INFO "NVIDIA Tesla T4 not detected, installing generic GPU support"
+    echo "[INFO] NVIDIA Tesla T4 not detected, installing generic GPU support..."
     
     # Install generic GPU packages
     apt install -y mesa-utils mesa-va-drivers mesa-vdpau-drivers vainfo \
         libva2 libva-drm2 libva-x11-2 libvdpau1 vdpau-driver-all \
         xserver-xorg-video-all libgl1-mesa-dri libglx-mesa0 \
-        libegl1-mesa libgbm1 libdrm2 >>"$LOG_FILE" 2>&1 || log WARN "Generic GPU package installation had warnings"
+        libegl1-mesa libgbm1 libdrm2 >/dev/null 2>&1 || true
     
     # Install Hyper-V specific drivers if running in Hyper-V
     if lspci | grep -i "microsoft.*hyper-v" >/dev/null 2>&1; then
-        log INFO "Detected Hyper-V environment, installing specific drivers"
+        echo "[INFO] Detected Hyper-V environment, installing specific drivers..."
         apt install -y xserver-xorg-video-fbdev linux-image-virtual \
-            linux-tools-virtual linux-cloud-tools-virtual >>"$LOG_FILE" 2>&1 || log WARN "Hyper-V driver installation had warnings"
+            linux-tools-virtual linux-cloud-tools-virtual >/dev/null 2>&1 || true
     fi
 fi
 
@@ -497,8 +430,22 @@ fi
 
 chown "$DESKTOP_USER:$DESKTOP_USER" "$SUNSHINE_CONFIG_DIR/sunshine.conf"
 
-# SSL certificates will be auto-generated by Sunshine on first run
-log INFO "SSL certificates will be created automatically by Sunshine"
+# Generate SSL certificates for Sunshine pairing
+echo "[INFO] Generating SSL certificates for Sunshine pairing..."
+su - "$DESKTOP_USER" -c "
+cd ~/.config/sunshine
+
+# Generate private key
+openssl genrsa -out sunshine.key 2048 2>/dev/null
+
+# Generate self-signed certificate
+openssl req -new -x509 -key sunshine.key -out sunshine.cert -days 365 -subj '/C=US/ST=State/L=City/O=Sunshine/CN=sunshine' 2>/dev/null
+
+# Set proper permissions
+chmod 600 sunshine.key sunshine.cert
+
+echo '[INFO] SSL certificates generated successfully'
+" 2>/dev/null || echo "[WARN] Certificate generation failed, Sunshine will create its own"
 
 # Create pairing helper script
 echo "[INFO] Creating pairing helper script..."
@@ -528,7 +475,15 @@ CERT_DIR="/home/$(whoami)/.config/sunshine"
 if [ -f "$CERT_DIR/sunshine.cert" ] && [ -f "$CERT_DIR/sunshine.key" ]; then
     echo "[OK] SSL certificates found"
 else
-    echo "[INFO] SSL certificates will be created automatically by Sunshine on first run"
+    echo "[WARN] SSL certificates missing, generating new ones..."
+    mkdir -p "$CERT_DIR"
+    cd "$CERT_DIR"
+    openssl genrsa -out sunshine.key 2048 2>/dev/null
+    openssl req -new -x509 -key sunshine.key -out sunshine.cert -days 365 \
+        -subj "/C=US/ST=State/L=City/O=Sunshine/CN=$SERVER_IP" 2>/dev/null
+    chmod 600 sunshine.key sunshine.cert
+    echo "[OK] New certificates generated"
+    echo "[INFO] You may need to restart Sunshine for changes to take effect"
 fi
 
 echo ""
@@ -784,51 +739,31 @@ SUNSHINE_PID=$(cat /tmp/sunshine-pid.tmp)
 rm -f /tmp/sunshine-pid.tmp
 
 echo ""
-echo "=========================================="
-echo "  SUNSHINE STARTED SUCCESSFULLY"
-echo "=========================================="
-echo ""
-log INFO "Sunshine started with PID: $SUNSHINE_PID"
-
-echo "=== CONNECTION INFORMATION ==="
-echo "Process ID: $SUNSHINE_PID"
-echo "Setup Log: $LOG_FILE"
-echo "Runtime Log: /tmp/sunshine-direct.log"
+echo "=== SUNSHINE STARTED ==="
+echo "PID: $SUNSHINE_PID"
+echo "Log: /tmp/sunshine-direct.log"
 echo "Web UI: https://localhost:47990"
-echo "User: $DESKTOP_USER"
-echo "Display: $DETECTED_DISPLAY"
-echo ""
 echo "To stop: kill $SUNSHINE_PID"
 echo ""
-
-# Display GPU status
 if [ "$NVIDIA_T4_DETECTED" = true ]; then
     echo "=== NVIDIA TESLA T4 STATUS ==="
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        echo "✓ Hardware acceleration: ENABLED"
-        echo "✓ Encoding method: NVENC H.264"
-        echo "✓ Capture method: NVFBC (NVIDIA Frame Buffer Capture)"
-        echo "✓ Preset: P4 (balanced quality/performance)"
-        echo "✓ Advanced features: Spatial/Temporal AQ, 2-pass encoding"
-        echo ""
-        echo "GPU Status:"
-        nvidia-smi --query-gpu=name,driver_version,temperature.gpu,utilization.gpu,utilization.memory --format=csv,noheader 2>/dev/null | sed 's/^/  /' || echo "  Unable to query GPU status"
-        echo ""
-        echo "Monitoring Commands:"
-        echo "  nvidia-smi              - Check GPU status"
-        echo "  nvidia-smi -q -d ENCODER - Monitor encoding usage"
-        echo "  watch nvidia-smi        - Real-time GPU monitoring"
-    else
-        echo "⚠ Hardware acceleration: CONFIGURED (reboot may be required)"
-        echo "  Run 'nvidia-smi' after reboot to verify"
-    fi
+    echo "Hardware acceleration: ENABLED"
+    echo "Encoding method: NVENC H.264"
+    echo "Capture method: NVFBC (NVIDIA Frame Buffer Capture)"
+    echo "Preset: P4 (balanced quality/performance)"
+    echo "Advanced features: Spatial/Temporal AQ, 2-pass encoding"
+    echo ""
+    echo "Tesla T4 Commands:"
+    echo "- Check GPU status: nvidia-smi"
+    echo "- Monitor encoding: nvidia-smi -q -d ENCODER"
+    echo "- Watch GPU usage: watch nvidia-smi"
     echo ""
 else
     echo "=== SOFTWARE RENDERING STATUS ==="
-    echo "⚠ Hardware acceleration: DISABLED (no Tesla T4 detected)"
-    echo "  Encoding method: libx264 (software)"
-    echo "  Capture method: KMS"
-    echo "  Note: Performance may be limited without hardware acceleration"
+    echo "Hardware acceleration: DISABLED (no Tesla T4 detected)"
+    echo "Encoding method: libx264 (software)"
+    echo "Capture method: KMS"
+    echo "Note: Performance may be limited without hardware acceleration"
     echo ""
 fi
 
@@ -845,6 +780,7 @@ echo "- Run: /usr/local/bin/sunshine-pair.sh (for detailed help)"
 echo "- Clear Moonlight app data/cache on client device"
 echo "- Restart Sunshine: sudo pkill sunshine && sudo ./sunshine_direct.sh"
 echo "- Try pairing from the same network first"
+echo "- Check that SSL certificates were generated correctly"
 echo ""
 echo "If you see 'Couldn't find monitor' errors:"
 echo "- This is normal in virtual environments (Hyper-V/VMware)"
@@ -867,41 +803,17 @@ echo "Check logs: tail -f /tmp/sunshine-direct.log"
 echo ""
 
 # Wait a moment for Sunshine to start
-log INFO "Waiting for Sunshine to initialize..."
 sleep 3
 
 # Check if Sunshine started successfully
 if ! kill -0 $SUNSHINE_PID 2>/dev/null; then
-    log ERROR "Sunshine failed to start! Check the logs below:"
-    echo ""
-    echo "=== SUNSHINE STARTUP LOG ==="
+    echo "[ERROR] Sunshine failed to start! Check the log:"
     cat /tmp/sunshine-direct.log
-    echo "==========================="
-    echo ""
-    log ERROR "Setup log: $LOG_FILE"
     exit 1
 fi
 
-log INFO "Sunshine is running successfully!"
-echo ""
-echo "=========================================="
-echo "  SUNSHINE IS READY FOR CONNECTIONS"
-echo "=========================================="
-echo ""
-echo "Setup completed successfully!"
-echo "Sunshine is now streaming on: https://localhost:47990"
-echo ""
-echo "=== NEXT STEPS ==="
-echo "1. Open Moonlight on your client device"
-echo "2. Add this PC using the server's IP address"
-echo "3. Accept the SSL certificate warning"
-echo "4. Enter the pairing PIN when prompted"
-echo ""
-echo "=== LOGS ==="
-echo "Setup log: $LOG_FILE"
-echo "Runtime log: /tmp/sunshine-direct.log"
-echo ""
-echo "Following Sunshine output (Ctrl+C to stop, Sunshine will continue)..."
+echo "[INFO] Sunshine is running successfully!"
+echo "[INFO] Following log output..."
 echo "========================"
 
 # Follow the log
