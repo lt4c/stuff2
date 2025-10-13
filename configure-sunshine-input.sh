@@ -204,9 +204,110 @@ fi
 echo ""
 
 # ============================================
-# STEP 8: Configure and restart Sunshine
+# STEP 8: Open firewall ports for Moonlight
 # ============================================
-echo "[STEP 8/8] Configuring Sunshine..."
+echo "[STEP 8/9] Opening firewall ports for Moonlight..."
+echo "---"
+
+# Moonlight/Sunshine required ports:
+# TCP 47984-47990: HTTPS/Configuration
+# TCP 48010: RTSP
+# UDP 47998-48000: Video stream
+# UDP 48010: Audio stream
+# UDP 48100-48200: Control stream (IMPORTANT for input!)
+
+if command -v ufw >/dev/null 2>&1; then
+    echo "[INFO] Configuring UFW firewall..."
+    
+    # Enable UFW if not already enabled
+    ufw --force enable 2>/dev/null || true
+    
+    # Sunshine web interface and pairing
+    ufw allow 47984:47990/tcp comment 'Sunshine HTTPS/Web UI' 2>/dev/null || true
+    
+    # Video streaming
+    ufw allow 47998:48000/udp comment 'Sunshine Video Stream' 2>/dev/null || true
+    
+    # Audio streaming  
+    ufw allow 48010/tcp comment 'Sunshine RTSP' 2>/dev/null || true
+    ufw allow 48010/udp comment 'Sunshine Audio Stream' 2>/dev/null || true
+    
+    # CRITICAL: Control stream for keyboard/mouse input
+    ufw allow 48100:48200/tcp comment 'Sunshine Control Stream' 2>/dev/null || true
+    ufw allow 48100:48200/udp comment 'Sunshine Control Stream' 2>/dev/null || true
+    
+    # Reload UFW
+    ufw reload 2>/dev/null || true
+    
+    echo "[SUCCESS] UFW firewall configured"
+    echo "[INFO] Opened ports:"
+    echo "  - TCP 47984-47990 (Web UI/Pairing)"
+    echo "  - TCP 48010 (RTSP)"
+    echo "  - UDP 47998-48000 (Video)"
+    echo "  - UDP 48010 (Audio)"
+    echo "  - TCP/UDP 48100-48200 (Control/Input) ← CRITICAL FOR KEYBOARD/MOUSE"
+    
+elif command -v firewall-cmd >/dev/null 2>&1; then
+    echo "[INFO] Configuring firewalld..."
+    
+    # Sunshine web interface and pairing
+    firewall-cmd --permanent --add-port=47984-47990/tcp 2>/dev/null || true
+    
+    # Video streaming
+    firewall-cmd --permanent --add-port=47998-48000/udp 2>/dev/null || true
+    
+    # Audio streaming
+    firewall-cmd --permanent --add-port=48010/tcp 2>/dev/null || true
+    firewall-cmd --permanent --add-port=48010/udp 2>/dev/null || true
+    
+    # CRITICAL: Control stream for keyboard/mouse input
+    firewall-cmd --permanent --add-port=48100-48200/tcp 2>/dev/null || true
+    firewall-cmd --permanent --add-port=48100-48200/udp 2>/dev/null || true
+    
+    # Reload firewall
+    firewall-cmd --reload 2>/dev/null || true
+    
+    echo "[SUCCESS] firewalld configured"
+    
+elif command -v iptables >/dev/null 2>&1; then
+    echo "[INFO] Configuring iptables..."
+    
+    # Sunshine web interface and pairing
+    iptables -A INPUT -p tcp --dport 47984:47990 -j ACCEPT 2>/dev/null || true
+    
+    # Video streaming
+    iptables -A INPUT -p udp --dport 47998:48000 -j ACCEPT 2>/dev/null || true
+    
+    # Audio streaming
+    iptables -A INPUT -p tcp --dport 48010 -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -p udp --dport 48010 -j ACCEPT 2>/dev/null || true
+    
+    # CRITICAL: Control stream for keyboard/mouse input
+    iptables -A INPUT -p tcp --dport 48100:48200 -j ACCEPT 2>/dev/null || true
+    iptables -A INPUT -p udp --dport 48100:48200 -j ACCEPT 2>/dev/null || true
+    
+    # Save iptables rules
+    if command -v iptables-save >/dev/null 2>&1; then
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+    
+    echo "[SUCCESS] iptables configured"
+else
+    echo "[WARN] No firewall detected (ufw/firewalld/iptables)"
+    echo "[INFO] If you have a firewall, manually open these ports:"
+    echo "  - TCP 47984-47990"
+    echo "  - TCP 48010"
+    echo "  - UDP 47998-48000"
+    echo "  - UDP 48010"
+    echo "  - TCP/UDP 48100-48200 (CRITICAL for input)"
+fi
+
+echo ""
+
+# ============================================
+# STEP 9: Configure and restart Sunshine
+# ============================================
+echo "[STEP 9/9] Configuring Sunshine..."
 echo "---"
 
 SUNSHINE_CONFIG_DIR="/home/$DESKTOP_USER/.config/sunshine"
@@ -320,18 +421,46 @@ echo "✓ uinput module loaded and configured"
 echo "✓ Device permissions set correctly"
 echo "✓ User added to required groups"
 echo "✓ Virtual device creation tested successfully"
+echo "✓ Firewall ports opened for Moonlight input/control"
 echo "✓ Sunshine configured and running"
 echo ""
+echo "FIREWALL PORTS OPENED:"
+echo "  - TCP 47984-47990 (Web UI/Pairing)"
+echo "  - TCP 48010 (RTSP)"
+echo "  - UDP 47998-48000 (Video stream)"
+echo "  - UDP 48010 (Audio stream)"
+echo "  - TCP/UDP 48100-48200 (Control/Input) ← KEYBOARD & MOUSE"
+echo ""
 echo "NEXT STEPS:"
-echo "1. Connect with Moonlight client"
+echo "1. Connect with Moonlight client to: $(hostname -I | awk '{print $1}')"
 echo "2. Test keyboard and mouse control"
 echo "3. Monitor logs: tail -f $LOGFILE"
 echo ""
-echo "To verify virtual devices are created when you connect:"
+echo "VERIFICATION COMMANDS:"
+echo "  # Check if virtual devices are created:"
 echo "  grep -i 'virtual.*keyboard\\|virtual.*mouse\\|uinput' $LOGFILE"
 echo ""
-echo "If input still doesn't work:"
-echo "  - Check Moonlight client settings (enable input)"
-echo "  - Check firewall/network settings"
-echo "  - Verify Sunshine web UI: https://server-ip:47990"
+echo "  # Check firewall status:"
+echo "  sudo ufw status | grep -E '47|48'"
+echo ""
+echo "  # Check Sunshine is listening on control ports:"
+echo "  sudo netstat -tulpn | grep sunshine"
+echo ""
+echo "If input STILL doesn't work:"
+echo "  1. Check Moonlight client settings:"
+echo "     - Enable 'Optimize game settings'"
+echo "     - Enable 'Mouse acceleration'"
+echo "  2. Check network connectivity:"
+echo "     - Ping server from client"
+echo "     - Check router/firewall between client and server"
+echo "  3. Verify Sunshine web UI: https://$(hostname -I | awk '{print $1}'):47990"
+echo "  4. Check logs for errors:"
+echo "     grep -i error $LOGFILE"
+echo ""
+echo "TROUBLESHOOTING:"
+echo "  If you see 'Connection refused' on control ports:"
+echo "    - Firewall is blocking (check cloud provider security groups)"
+echo "  If you see video but no input:"
+echo "    - Control ports 48100-48200 are blocked"
+echo "    - Run: sudo ufw allow 48100:48200/tcp && sudo ufw allow 48100:48200/udp"
 echo ""
