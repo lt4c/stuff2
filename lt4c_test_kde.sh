@@ -81,6 +81,8 @@ if ! id -u "$USER_NAME" >/dev/null 2>&1; then
   echo "${USER_NAME}:${USER_PASS}" | chpasswd
   usermod -aG sudo "$USER_NAME"
 fi
+# Add user to essential groups for Sunshine streaming
+usermod -aG video,render,audio,input,uinput "$USER_NAME" 2>/dev/null || true
 USER_UID="$(id -u "$USER_NAME")"
 
 # =================== DESKTOP + XRDP + TigerVNC ===================
@@ -337,7 +339,7 @@ ExecStart=/usr/bin/sunshine
 Restart=on-failure
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
-SupplementaryGroups=input uinput
+SupplementaryGroups=input uinput video render audio
 NoNewPrivileges=true
 
 [Install]
@@ -349,8 +351,10 @@ chown "${USER_NAME}:${USER_NAME}" "$USR_UNIT_DIR/sunshine.service"
 su - "${USER_NAME}" -c 'systemctl --user daemon-reload' || true
 su - "${USER_NAME}" -c 'systemctl --user enable --now sunshine' || true
 
-# Input stack
+# Input stack and comprehensive permissions setup
 apt -y install evtest joystick >>"$LOG" 2>&1 || true
+
+# Ensure required kernel modules are loaded
 MODULE_CONF="/etc/modules-load.d/uinput.conf"
 if [[ -f "$MODULE_CONF" ]]; then
   if ! grep -qxF 'uinput' "$MODULE_CONF"; then
@@ -359,23 +363,57 @@ if [[ -f "$MODULE_CONF" ]]; then
 else
   echo 'uinput' >"$MODULE_CONF"
 fi
+
+# Load uinput module immediately
 modprobe uinput || true
+
+# Create necessary groups
 groupadd -f input
 groupadd -f uinput
-usermod -aG input,uinput "${USER_NAME}"
+groupadd -f video
+groupadd -f render
+groupadd -f audio
+
+# Add user to all required groups
+usermod -aG input,uinput,video,render,audio "${USER_NAME}"
+
+# Comprehensive udev rules for input devices
 cat >/etc/udev/rules.d/60-sunshine-input.rules <<'EOF'
-KERNEL=="uinput", MODE="0660", GROUP="uinput", OPTIONS+="static_node=uinput"
-SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"
+# uinput device permissions
+KERNEL=="uinput", MODE="0666", GROUP="uinput", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="misc", KERNEL=="uinput", MODE="0666", GROUP="uinput", TAG+="uaccess"
+
+# Input event devices
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0664", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="mouse*", MODE="0664", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="js*", MODE="0664", GROUP="input"
+
+# GPU devices for hardware acceleration
+SUBSYSTEM=="drm", KERNEL=="card*", MODE="0666", GROUP="video"
+SUBSYSTEM=="drm", KERNEL=="renderD*", MODE="0666", GROUP="render"
 EOF
+
 chmod 644 /etc/udev/rules.d/60-sunshine-input.rules
+
+# Force create uinput device node if it doesn't exist
+if [[ ! -e /dev/uinput ]]; then
+  mknod /dev/uinput c 10 223 || true
+fi
+
+# Set immediate permissions
+chmod 666 /dev/uinput 2>/dev/null || true
+chgrp uinput /dev/uinput 2>/dev/null || true
+
+# Reload and trigger udev rules
 udevadm control --reload-rules || true
 udevadm trigger --subsystem-match=misc --action=add || true
 udevadm trigger --subsystem-match=input --action=change || true
+udevadm trigger --subsystem-match=drm --action=change || true
 
 # Ensure Sunshine service has input supplementary group
 cat >/etc/systemd/system/sunshine.service.d/10-input.conf <<'EOF'
 [Service]
-SupplementaryGroups=input uinput
+SupplementaryGroups=input uinput video render audio
 EOF
 
 # Additional uinput permissions for Sunshine streaming
