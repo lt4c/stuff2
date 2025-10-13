@@ -17,7 +17,7 @@ export APT_LISTCHANGES_FRONTEND=none
 LOG="/var/log/a_sh_install.log"
 
 USER_NAME="${USER_NAME:-lt4c}"
-USER_PASS="${USER_PASS:-lt4c}"
+USER_PASS="${USER_PASS:-lt4c@2025}"
 VNC_PASS="${VNC_PASS:-lt4c}"
 GEOM="${GEOM:-1280x720}"
 VNC_PORT="${VNC_PORT:-5900}"
@@ -377,6 +377,25 @@ cat >/etc/systemd/system/sunshine.service.d/10-input.conf <<'EOF'
 [Service]
 SupplementaryGroups=input uinput
 EOF
+
+# Additional uinput permissions for Sunshine streaming
+# Create udev rule to ensure uinput device has proper permissions
+cat >/etc/udev/rules.d/99-sunshine-uinput.rules <<'EOF'
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput", MODE="0660", GROUP="uinput"
+EOF
+
+# Ensure the uinput group exists and user is added
+groupadd -f uinput
+usermod -aG uinput "${USER_NAME}"
+
+# Set proper permissions on /dev/uinput
+chmod 660 /dev/uinput 2>/dev/null || true
+chgrp uinput /dev/uinput 2>/dev/null || true
+
+# Reload udev rules and trigger
+udevadm control --reload-rules
+udevadm trigger --subsystem-match=misc --action=add
+
 systemctl daemon-reload
 systemctl restart sunshine || true
 
