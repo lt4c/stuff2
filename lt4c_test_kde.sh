@@ -296,7 +296,7 @@ exit 1
 EOF
 chmod +x /usr/local/bin/sunshine-wait-uinput.sh
 
-# Override systemd: run Sunshine as user lt4c on DISPLAY :0
+# Override systemd: run Sunshine as user lt4c with dynamic display detection
 install -d /etc/systemd/system/sunshine.service.d
 cat >/etc/systemd/system/sunshine.service.d/override.conf <<EOF
 [Service]
@@ -305,6 +305,7 @@ Group=${USER_NAME}
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
 ExecStartPre=/usr/local/bin/sunshine-wait-uinput.sh
+ExecStartPre=/usr/local/bin/sunshine-display-setup.sh
 EOF
 
 install -d -m 0700 -o "$USER_UID" -g "$USER_UID" "/run/user/${USER_UID}" || true
@@ -333,13 +334,18 @@ After=graphical-session.target network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=exec
 ExecStartPre=/usr/local/bin/sunshine-wait-uinput.sh
-ExecStart=/usr/bin/sunshine
+ExecStart=/usr/local/bin/sunshine-wrapper.sh
 Restart=on-failure
+RestartSec=5
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
+Environment=SYSTEMD_IGNORE_CHROOT=1
 SupplementaryGroups=input uinput video render audio
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
 NoNewPrivileges=true
 
 [Install]
@@ -437,27 +443,249 @@ udevadm trigger --subsystem-match=misc --action=add
 systemctl daemon-reload
 systemctl restart sunshine || true
 
-# =================== Sunshine autostart in XRDP sessions ===================
-step "7.3/11 Bật Sunshine tự khởi động trong phiên XRDP"
+# =================== Sunshine RDP display permissions & autostart ===================
+step "7.3/11 Cấu hình Sunshine cho RDP displays + tự khởi động"
+
+# Create enhanced script to detect display and prevent Sunshine shutdown issues
+cat >/usr/local/bin/sunshine-display-setup.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Function to detect current display
+detect_display() {
+    # Check for RDP display first
+    if [ -n "${XRDP_SESSION:-}" ] || [ "${DESKTOP_SESSION:-}" = "xrdp" ]; then
+        # RDP session - find the display
+        for display in /tmp/.X11-unix/X*; do
+            if [ -S "$display" ]; then
+                display_num="${display##*/X}"
+                echo ":${display_num}"
+                return 0
+            fi
+        done
+        # Fallback for RDP
+        echo ":10"
+    elif [ -n "${DISPLAY:-}" ]; then
+        echo "$DISPLAY"
+    else
+        # Default fallback
+        echo ":0"
+    fi
+}
+
+# Set display and permissions
+DETECTED_DISPLAY="$(detect_display)"
+export DISPLAY="$DETECTED_DISPLAY"
+
+# Ensure X11 socket permissions for RDP
+X11_SOCKET="/tmp/.X11-unix/X${DETECTED_DISPLAY#:}"
+if [ -S "$X11_SOCKET" ]; then
+    chmod 777 "$X11_SOCKET" 2>/dev/null || true
+fi
+
+# Set XAUTHORITY for RDP sessions
+if [ -z "${XAUTHORITY:-}" ]; then
+    if [ -f "$HOME/.Xauthority" ]; then
+        export XAUTHORITY="$HOME/.Xauthority"
+    elif [ -f "/home/$USER/.Xauth" ]; then
+        export XAUTHORITY="/home/$USER/.Xauth"
+    fi
+fi
+
+# Prevent premature shutdown by setting up proper session environment
+export XDG_SESSION_TYPE="x11"
+export XDG_SESSION_CLASS="user"
+export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-plasma}"
+
+# Ensure dbus session is available
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+    if [ -f "$HOME/.dbus/session-bus/*" ]; then
+        export DBUS_SESSION_BUS_ADDRESS="unix:path=$(ls $HOME/.dbus/session-bus/* | head -1)"
+    fi
+fi
+
+# Set up systemd user session environment
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user import-environment DISPLAY XAUTHORITY XDG_SESSION_TYPE XDG_SESSION_CLASS XDG_SESSION_DESKTOP DBUS_SESSION_BUS_ADDRESS 2>/dev/null || true
+fi
+
+echo "Sunshine display setup: DISPLAY=$DISPLAY, XAUTHORITY=${XAUTHORITY:-none}, SESSION_TYPE=${XDG_SESSION_TYPE:-none}"
+EOF
+chmod +x /usr/local/bin/sunshine-display-setup.sh
+
+# Create enhanced Sunshine wrapper script to prevent RDP shutdown issues
+cat >/usr/local/bin/sunshine-wrapper.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Source display setup
+source /usr/local/bin/sunshine-display-setup.sh
+
+# Comprehensive signal handling to prevent RDP session shutdown
+trap 'echo "[INFO] Ignoring TERM signal, Sunshine continues running..."' TERM
+trap 'echo "[INFO] Ignoring HUP signal, Sunshine continues running..."' HUP
+trap 'echo "[INFO] Ignoring INT signal, Sunshine continues running..."' INT
+trap 'echo "[INFO] Ignoring QUIT signal, Sunshine continues running..."' QUIT
+
+# Ensure we're in a proper session context
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
+# Create runtime directory if it doesn't exist
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+# Disable various session management systems that might cause shutdown
+export SYSTEMD_IGNORE_CHROOT=1
+export NO_AT_BRIDGE=1
+export DBUS_FATAL_WARNINGS=0
+
+# RDP-specific environment fixes
+export XDG_SESSION_TYPE="x11"
+export XDG_SESSION_CLASS="user" 
+export XDG_CURRENT_DESKTOP="KDE"
+export DESKTOP_SESSION="plasma"
+
+# Prevent session manager interference
+unset SESSION_MANAGER
+unset GNOME_DESKTOP_SESSION_ID
+
+# Start Sunshine in a new process group to isolate from session signals
+echo "[INFO] Starting Sunshine with DISPLAY=$DISPLAY (PID=$$)"
+setsid /usr/bin/sunshine "$@" &
+SUNSHINE_PID=$!
+
+# Monitor Sunshine and restart if it exits unexpectedly
+while true; do
+    if ! kill -0 $SUNSHINE_PID 2>/dev/null; then
+        echo "[WARN] Sunshine process $SUNSHINE_PID exited, restarting..."
+        sleep 2
+        setsid /usr/bin/sunshine "$@" &
+        SUNSHINE_PID=$!
+    fi
+    sleep 5
+done
+EOF
+chmod +x /usr/local/bin/sunshine-wrapper.sh
+
+# Create direct Sunshine launcher for manual testing (bypasses all session management)
+cat >/usr/local/bin/sunshine-direct.sh <<'EOF'
+#!/usr/bin/env bash
+# Direct Sunshine launcher for RDP testing - bypasses session management
+
+echo "[INFO] Direct Sunshine launcher for RDP display testing"
+
+# Detect RDP display
+DETECTED_DISPLAY=":0"
+for display in /tmp/.X11-unix/X*; do
+    if [ -S "$display" ]; then
+        display_num="${display##*/X}"
+        DETECTED_DISPLAY=":${display_num}"
+        echo "[INFO] Found X11 socket: $display -> $DETECTED_DISPLAY"
+        break
+    fi
+done
+
+export DISPLAY="$DETECTED_DISPLAY"
+echo "[INFO] Using DISPLAY=$DISPLAY"
+
+# Set minimal required environment
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export XDG_SESSION_TYPE="x11"
+export XDG_CURRENT_DESKTOP="KDE"
+export DESKTOP_SESSION="plasma"
+
+# Disable all session management
+export SYSTEMD_IGNORE_CHROOT=1
+export NO_AT_BRIDGE=1
+export DBUS_FATAL_WARNINGS=0
+unset SESSION_MANAGER
+unset GNOME_DESKTOP_SESSION_ID
+
+# Create runtime dir
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
+# Set X11 permissions
+X11_SOCKET="/tmp/.X11-unix/X${DETECTED_DISPLAY#:}"
+if [ -S "$X11_SOCKET" ]; then
+    chmod 777 "$X11_SOCKET" 2>/dev/null || true
+    echo "[INFO] Set permissions on $X11_SOCKET"
+fi
+
+# Check uinput
+if [ ! -w /dev/uinput ]; then
+    echo "[WARN] /dev/uinput not writable, input may not work"
+fi
+
+echo "[INFO] Starting Sunshine directly (no session management)"
+echo "[INFO] Press Ctrl+C to stop"
+
+# Start Sunshine with nohup to completely detach from terminal session
+nohup /usr/bin/sunshine > /tmp/sunshine-direct.log 2>&1 &
+SUNSHINE_PID=$!
+
+echo "[INFO] Sunshine started with PID $SUNSHINE_PID"
+echo "[INFO] Log file: /tmp/sunshine-direct.log"
+echo "[INFO] To stop: kill $SUNSHINE_PID"
+
+# Follow the log
+tail -f /tmp/sunshine-direct.log
+EOF
+chmod +x /usr/local/bin/sunshine-direct.sh
+
+# Enhanced user session configuration for RDP
 USER_XSESSION="/home/${USER_NAME}/.xsessionrc"
 if [[ ! -f "$USER_XSESSION" ]]; then
   install -m 0644 -o "${USER_NAME}" -g "${USER_NAME}" /dev/null "$USER_XSESSION"
 fi
+
 if ! grep -q 'SUNSHINE_XRDP_AUTOSTART' "$USER_XSESSION" 2>/dev/null; then
   cat <<'EOF' >>"$USER_XSESSION"
 
 # >>> SUNSHINE_XRDP_AUTOSTART >>>
-if [ "${DESKTOP_SESSION:-}" = "xrdp" ] && ! pgrep -u "$USER" -x sunshine >/dev/null; then
+# Enhanced Sunshine startup for RDP sessions
+if ! pgrep -u "$USER" -x sunshine >/dev/null; then
+    # Set up display environment
+    source /usr/local/bin/sunshine-display-setup.sh
+    
+    # Wait for input devices
     if /usr/local/bin/sunshine-wait-uinput.sh; then
-        /usr/bin/sunshine >>"$HOME/.local/share/sunshine/xrdp.log" 2>&1 &
+        # Start Sunshine with proper environment
+        /usr/bin/sunshine >>"$HOME/.local/share/sunshine/session.log" 2>&1 &
+        echo "[INFO] Sunshine started for display $DISPLAY" >>"$HOME/.local/share/sunshine/session.log"
     else
-        echo "[WARN] Sunshine skipped (uinput not ready)" >>"$HOME/.local/share/sunshine/xrdp.log"
+        echo "[WARN] Sunshine skipped (uinput not ready)" >>"$HOME/.local/share/sunshine/session.log"
     fi
 fi
 # <<< SUNSHINE_XRDP_AUTOSTART <<<
 EOF
   chown "${USER_NAME}:${USER_NAME}" "$USER_XSESSION"
 fi
+
+# Add RDP-specific X11 permissions
+cat >/etc/X11/Xwrapper.config <<'EOF'
+# Allow anybody to start X server
+allowed_users=anybody
+needs_root_rights=yes
+EOF
+
+# Ensure proper permissions for X11 sockets in RDP sessions
+cat >/etc/systemd/system/x11-rdp-permissions.service <<EOF
+[Unit]
+Description=Set X11 RDP permissions
+After=xrdp.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'chmod 777 /tmp/.X11-unix/X* 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable x11-rdp-permissions.service || true
 
 if [[ "$ENABLE_VIGEM" == "true" ]]; then
   # =================== ViGEm/vgamepad via DKMS (optional) ===================
@@ -579,6 +807,10 @@ echo "TigerVNC : ${IP}:${VNC_PORT}  (pass: ${VNC_PASS})"
 echo "XRDP     : ${IP}:3389        (user ${USER_NAME} / ${USER_PASS})"
 echo "Sunshine : https://${IP}:${SUN_HTTP_TLS_PORT}  (UI tự ký; auto-add Steam & Chromium)"
 echo "Moonlight: Mở shortcut 'Moonlight (Sunshine Web UI)' trên Desktop để pair"
+echo ""
+echo "=== SUNSHINE RDP TESTING ==="
+echo "For RDP display testing, run: sudo -u ${USER_NAME} /usr/local/bin/sunshine-direct.sh"
+echo "This bypasses session management and should prevent shutdown issues."
 
 echo "---- DEBUG ----"
 ip -o -4 addr show up | awk '{print $2, $4}' || true
