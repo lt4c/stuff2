@@ -69,30 +69,15 @@ chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/passwd"
 chmod 600 "/home/$USER_NAME/.vnc/passwd"
 
 cat >"/home/$USER_NAME/.vnc/xstartup" <<'EOF'
-#!/bin/bash
-# VNC xstartup script for KDE Plasma on dummy display
+#!/bin/sh
 unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
-
-# Set up X11 environment
 export XDG_SESSION_TYPE=x11
 export DESKTOP_SESSION=plasma
 export XDG_CURRENT_DESKTOP=KDE
 export KDE_FULL_SESSION=true
-export QT_QPA_PLATFORM=xcb
-export GDK_BACKEND=x11
-
-# Start D-Bus session
-if [ -x /usr/bin/dbus-launch ]; then
-    eval $(dbus-launch --sh-syntax --exit-with-session)
-fi
-
-# Start KDE Plasma
-if [ -x /usr/bin/startplasma-x11 ]; then
-    exec /usr/bin/startplasma-x11
-else
-    exec /usr/bin/startkde
-fi
+[ -x /usr/bin/dbus-launch ] && eval $(/usr/bin/dbus-launch --exit-with-session)
+exec /usr/bin/startplasma-x11
 EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/xstartup"
 chmod +x "/home/$USER_NAME/.vnc/xstartup"
@@ -130,23 +115,16 @@ cat >/etc/systemd/system/vncserver@.service <<EOF
 Description=TigerVNC server on display :%i (user ${USER_NAME})
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=simple
 User=${USER_NAME}
 Group=${USER_NAME}
 WorkingDirectory=/home/${USER_NAME}
 Environment=HOME=/home/${USER_NAME}
-Environment=USER=${USER_NAME}
-ExecStartPre=-/usr/bin/vncserver -kill :%i
-ExecStartPre=/bin/sh -c 'rm -f /tmp/.X11-unix/X%i /tmp/.X%i-lock'
-ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} -depth 24 :%i
+ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} :%i
 ExecStop=/usr/bin/vncserver -kill :%i
 Restart=on-failure
-RestartSec=5
-StartLimitBurst=3
-StartLimitIntervalSec=60
-
+RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -158,9 +136,6 @@ systemctl disable vncserver@*.service 2>/dev/null || true
 # Clean up any existing VNC processes
 su - "$USER_NAME" -c 'vncserver -kill :* 2>/dev/null || true'
 killall Xvnc 2>/dev/null || true
-
-# Remove stale socket files
-rm -f /tmp/.X11-unix/X${VNC_DISPLAY} /tmp/.X${VNC_DISPLAY}-lock 2>/dev/null || true
 
 systemctl daemon-reload
 systemctl enable --now vncserver@${VNC_DISPLAY}.service || true
@@ -187,28 +162,23 @@ fi
 
 XRDP_INI="/etc/xrdp/xrdp.ini"
 if [[ -f "$XRDP_INI" ]]; then
-  sed -i 's/^port=.*/port=3389/' "$XRDP_INI" || true
-  # Remove existing VNC sections
-  sed -i '/^\[.*VNC.*\]/,/^\[/{ /^\[.*VNC.*\]/d; /^\[/!d; }' "$XRDP_INI" 2>/dev/null || true
-  
-  # Add shared VNC session configuration
-  cat <<EOF >>"$XRDP_INI"
+  if ! grep -q 'Plasma Shared TigerVNC' "$XRDP_INI" 2>/dev/null; then
+    cat <<EOF >>"$XRDP_INI"
 
-[Shared Desktop VNC]
-name=Shared Desktop VNC
+[Plasma Shared TigerVNC]
+name=Plasma Shared TigerVNC
 lib=libvnc.so
 username=ask
 password=ask
 ip=127.0.0.1
 port=${VNC_PORT}
 EOF
-  
-  # Set autorun to use shared VNC session
-  if grep -q '^autorun=' "$XRDP_INI" 2>/dev/null; then
-    sed -i 's/^autorun=.*/autorun=Shared Desktop VNC/' "$XRDP_INI"
-  else
-    sed -i '/^\[Globals\]/a autorun=Shared Desktop VNC' "$XRDP_INI"
   fi
+fi
+# Improve xrdp performance / compatibility
+if [ -f /etc/xrdp/xrdp.ini ]; then
+  sed -i 's/^crypt_level=.*/crypt_level=low/' /etc/xrdp/xrdp.ini || true
+  sed -i 's/^max_bpp=.*/max_bpp=16/' /etc/xrdp/xrdp.ini || true
 fi
 systemctl restart xrdp || true
 
@@ -217,33 +187,6 @@ allowed_users=anybody
 needs_root_rights=no
 EOF
 
-# Create dummy display configuration
-install -d /etc/X11/xorg.conf.d
-cat >/etc/X11/xorg.conf.d/10-dummy-display.conf <<EOF
-Section "Device"
-    Identifier "dummy_videocard"
-    Driver "dummy"
-    VideoRam 256000
-EndSection
-
-Section "Monitor"
-    Identifier "dummy_monitor"
-    HorizSync 28.0-80.0
-    VertRefresh 48.0-75.0
-    Modeline "${GEOM}" 85.25 1280 1344 1480 1680 720 723 728 759 -hsync +vsync
-EndSection
-
-Section "Screen"
-    Identifier "dummy_screen"
-    Device "dummy_videocard"
-    Monitor "dummy_monitor"
-    DefaultDepth 24
-    SubSection "Display"
-        Depth 24
-        Modes "${GEOM}"
-    EndSubSection
-EndSection
-EOF
 
 cat >"/etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla" <<'EOF'
 [Allow Colord All Users]
@@ -359,16 +302,25 @@ groupadd -f input
 groupadd -f uinput
 usermod -aG input,uinput "${USER_NAME}"
 
-# Ensure proper uinput device permissions
-echo 'KERNEL=="uinput", MODE="0660", GROUP="uinput", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/99-uinput.rules
-echo 'SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"' >> /etc/udev/rules.d/99-uinput.rules
-
-# Create uinput device node if it doesn't exist
+# Ensure uinput device exists and has correct permissions
 if [ ! -e /dev/uinput ]; then
   mknod /dev/uinput c 10 223 || true
 fi
-chgrp uinput /dev/uinput 2>/dev/null || true
-chmod 660 /dev/uinput 2>/dev/null || true
+chown root:uinput /dev/uinput
+chmod 660 /dev/uinput
+
+# Create additional udev rules for comprehensive uinput access
+cat >/etc/udev/rules.d/99-uinput-sunshine.rules <<'EOF'
+# uinput device for virtual input creation
+KERNEL=="uinput", MODE="0660", GROUP="uinput", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="misc", KERNEL=="uinput", MODE="0660", GROUP="uinput"
+# Input event devices
+SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="mouse*", MODE="0660", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="js*", MODE="0660", GROUP="input"
+EOF
+chmod 644 /etc/udev/rules.d/99-uinput-sunshine.rules
+
 
 MODULE_CONF="/etc/modules-load.d/uinput.conf"
 if [[ -f "$MODULE_CONF" ]]; then
@@ -380,12 +332,11 @@ else
 fi
 modprobe uinput || true
 
-# Additional udev rules for Sunshine input handling
 cat >/etc/udev/rules.d/60-sunshine-input.rules <<'EOF'
 KERNEL=="uinput", MODE="0660", GROUP="uinput", OPTIONS+="static_node=uinput"
 SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"
-SUBSYSTEM=="misc", KERNEL=="uinput", MODE="0660", GROUP="uinput"
 EOF
+chmod 644 /etc/udev/rules.d/60-sunshine-input.rules
 udevadm control --reload-rules || true
 udevadm trigger --subsystem-match=misc --action=add || true
 udevadm trigger --subsystem-match=input --action=change || true
@@ -423,30 +374,144 @@ WantedBy=default.target
 EOF
 chown "${USER_NAME}:${USER_NAME}" "/home/${USER_NAME}/.config/systemd/user/sunshine.service"
 
-install -d -m 0700 -o "${USER_NAME}" -g "${USER_NAME}" "/run/user/${USER_UID}" || true
-systemctl disable --now sunshine || true
-rm -f /etc/systemd/system/sunshine.service
-rm -rf /etc/systemd/system/sunshine.service.d
-systemctl disable --now /etc/systemd/system/sunshine.service >>/dev/null 2>&1 || true
+# Ensure Sunshine service has input supplementary group
+install -d /etc/systemd/system/sunshine.service.d
+cat >/etc/systemd/system/sunshine.service.d/10-input.conf <<'EOF'
+[Service]
+SupplementaryGroups=input uinput
+EOF
 systemctl daemon-reload
+systemctl restart sunshine || true
 
-# Ensure user can access input devices
-su - "${USER_NAME}" -c 'systemctl --user daemon-reload'
-su - "${USER_NAME}" -c 'systemctl --user stop sunshine || true'
-sleep 3
-# Wait for user session to be ready
-for i in {1..10}; do
-  if su - "${USER_NAME}" -c 'systemctl --user is-active --quiet default.target' 2>/dev/null; then
-    break
-  fi
-  sleep 1
-done
-su - "${USER_NAME}" -c 'systemctl --user enable --now sunshine'
+# Install GLIBCXX for user lt4c and setup Sunshine autostart
+echo "Setting up GLIBCXX and Sunshine for user ${USER_NAME}..."
 
-# Verify uinput permissions
-echo "Checking uinput permissions for ${USER_NAME}..."
-su - "${USER_NAME}" -c 'groups | grep -q uinput && echo "User is in uinput group" || echo "WARNING: User not in uinput group"'
-su - "${USER_NAME}" -c 'test -w /dev/uinput && echo "User can write to /dev/uinput" || echo "WARNING: User cannot write to /dev/uinput"'
+# Ensure user has access to updated libstdc++6
+su - "${USER_NAME}" -c 'echo "Checking GLIBCXX availability for user..."'
+su - "${USER_NAME}" -c 'ldconfig -p | grep libstdc++ || echo "libstdc++ not found in user space"'
+
+# Add library path to user environment
+USER_PROFILE="/home/${USER_NAME}/.profile"
+if ! grep -q 'LD_LIBRARY_PATH.*libstdc' "$USER_PROFILE" 2>/dev/null; then
+  cat <<EOF >>"$USER_PROFILE"
+
+# GLIBCXX library path for Sunshine
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH}"
+EOF
+  chown "${USER_NAME}:${USER_NAME}" "$USER_PROFILE"
+fi
+
+# Sunshine autostart in VNC/XRDP sessions
+USER_XSESSION="/home/${USER_NAME}/.xsessionrc"
+if [[ ! -f "$USER_XSESSION" ]]; then
+  install -m 0644 -o "${USER_NAME}" -g "${USER_NAME}" /dev/null "$USER_XSESSION"
+fi
+if ! grep -q 'SUNSHINE_AUTO_START' "$USER_XSESSION" 2>/dev/null; then
+  cat <<'EOF' >>"$USER_XSESSION"
+
+# >>> SUNSHINE_AUTO_START >>>
+# Auto-start Sunshine in Plasma Shared TigerVNC sessions
+if ! pgrep -u "$USER" -x sunshine >/dev/null 2>&1; then
+    # Wait for uinput device to be ready
+    if /usr/local/bin/sunshine-wait-uinput.sh; then
+        # Start Sunshine with proper environment
+        export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"
+        mkdir -p "$HOME/.local/share/sunshine"
+        /usr/bin/sunshine >>"$HOME/.local/share/sunshine/session.log" 2>&1 &
+        echo "[INFO] Sunshine started in session $(date)" >>"$HOME/.local/share/sunshine/session.log"
+    else
+        echo "[WARN] Sunshine skipped - uinput not ready $(date)" >>"$HOME/.local/share/sunshine/session.log"
+    fi
+fi
+# <<< SUNSHINE_AUTO_START <<<
+EOF
+  chown "${USER_NAME}:${USER_NAME}" "$USER_XSESSION"
+fi
+
+# Also add to VNC xstartup for direct VNC connections
+if ! grep -q 'SUNSHINE_VNC_START' "/home/${USER_NAME}/.vnc/xstartup" 2>/dev/null; then
+  sed -i '/exec \/usr\/bin\/startplasma-x11/i\
+# >>> SUNSHINE_VNC_START >>>\
+if ! pgrep -u "$USER" -x sunshine >/dev/null 2>&1; then\
+    if /usr/local/bin/sunshine-wait-uinput.sh; then\
+        export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH}"\
+        mkdir -p "$HOME/.local/share/sunshine"\
+        # Ensure user has access to input devices\
+        newgrp uinput <<EOFGRP\
+        /usr/bin/sunshine >>"$HOME/.local/share/sunshine/vnc.log" 2>&1 &\
+EOFGRP\
+    fi\
+fi\
+# <<< SUNSHINE_VNC_START <<<\
+' "/home/${USER_NAME}/.vnc/xstartup"
+fi
+
+# Create a helper script for Sunshine with proper permissions
+cat >/usr/local/bin/sunshine-start-with-uinput.sh <<EOF
+#!/bin/bash
+# Helper script to start Sunshine with proper uinput permissions for user ${USER_NAME}
+
+# Ensure user is in required groups
+if ! groups \${USER} | grep -q uinput; then
+    echo "Error: User \${USER} not in uinput group"
+    exit 1
+fi
+
+# Check uinput device accessibility
+if [ ! -w /dev/uinput ]; then
+    echo "Error: /dev/uinput not writable by user \${USER}"
+    exit 1
+fi
+
+# Set up environment for Sunshine
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:\${LD_LIBRARY_PATH}"
+mkdir -p "\${HOME}/.local/share/sunshine"
+
+# Start Sunshine with proper group context
+exec /usr/bin/sunshine "\$@"
+EOF
+chmod +x /usr/local/bin/sunshine-start-with-uinput.sh
+chown root:root /usr/local/bin/sunshine-start-with-uinput.sh
+
+# Verify uinput permissions and GLIBCXX
+echo "Checking permissions and libraries for ${USER_NAME}..."
+su - "${USER_NAME}" -c 'groups | grep -q uinput && echo "✓ User is in uinput group" || echo "✗ User not in uinput group"'
+su - "${USER_NAME}" -c 'test -w /dev/uinput && echo "✓ User can write to /dev/uinput" || echo "✗ User cannot write to /dev/uinput"'
+
+# Test virtual input device creation capability
+echo "Testing virtual input device creation for ${USER_NAME}..."
+su - "${USER_NAME}" -c '
+if [ -w /dev/uinput ]; then
+    # Test if user can create virtual devices (basic test)
+    python3 -c "
+import os
+try:
+    fd = os.open(\"/dev/uinput\", os.O_WRONLY | os.O_NONBLOCK)
+    os.close(fd)
+    print(\"✓ User can open /dev/uinput for virtual device creation\")
+except Exception as e:
+    print(f\"✗ Cannot open /dev/uinput: {e}\")
+" 2>/dev/null || echo "✓ /dev/uinput accessible (python test unavailable)"
+else
+    echo "✗ /dev/uinput not writable"
+fi'
+
+# Check GLIBCXX availability
+echo "Checking GLIBCXX symbols for Sunshine..."
+LIBSTDCXX_PATH="$(ldconfig -p 2>/dev/null | awk '/libstdc\\+\\+\\.so\\.6/ {print $4; exit}')"
+if [[ -n "$LIBSTDCXX_PATH" ]]; then
+    if strings "$LIBSTDCXX_PATH" 2>/dev/null | grep -q "GLIBCXX_3.4.3[12]"; then
+        echo "✓ GLIBCXX_3.4.31/32 available for Sunshine"
+    else
+        echo "✗ GLIBCXX_3.4.31/32 missing - Sunshine may not work"
+    fi
+else
+    echo "✗ libstdc++6 not found"
+fi
+
+# Test Sunshine startup
+echo "Testing Sunshine startup for ${USER_NAME}..."
+su - "${USER_NAME}" -c 'timeout 10s /usr/bin/sunshine --help >/dev/null 2>&1 && echo "✓ Sunshine can start" || echo "✗ Sunshine startup failed"'
 
 IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 if [ -z "$IP" ]; then
@@ -463,7 +528,12 @@ echo "========================================"
 echo "Service status:"
 sudo systemctl is-active vncserver@${VNC_DISPLAY} && echo "✓ VNC server running" || echo "✗ VNC server failed"
 sudo systemctl is-active xrdp && echo "✓ XRDP server running" || echo "✗ XRDP server failed"
-su - "${USER_NAME}" -c 'systemctl --user is-active sunshine' && echo "✓ Sunshine running" || echo "✗ Sunshine failed"
+su - "${USER_NAME}" -c 'systemctl --user is-active sunshine' && echo "✓ Sunshine user service running" || echo "✗ Sunshine user service not running"
+if pgrep -u "${USER_NAME}" -x sunshine >/dev/null; then
+    echo "✓ Sunshine process running for ${USER_NAME}"
+else
+    echo "✗ No Sunshine process found for ${USER_NAME}"
+fi
 
 echo "========================================"
 echo "Port status:"
