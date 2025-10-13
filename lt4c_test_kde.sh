@@ -27,13 +27,8 @@ else
     USER_PASS="${USER_PASS}"
 fi
 
-if [ -z "${VNC_PASS:-}" ]; then
-    VNC_PASS="$(openssl rand -base64 12)"
-    echo "[SECURITY] Generated VNC password: $VNC_PASS" | tee -a /root/lt4c-credentials.txt
-    chmod 600 /root/lt4c-credentials.txt
-else
-    VNC_PASS="${VNC_PASS}"
-fi
+# Use fixed VNC password (not randomly generated)
+VNC_PASS="${VNC_PASS:-lt4c}"
 
 GEOM="${GEOM:-1920x1080}"
 VNC_PORT="${VNC_PORT:-5900}"
@@ -86,7 +81,7 @@ wait_for_service() {
         ((count++))
     done
     log ERROR "$service failed to start within ${timeout}s"
-    systemctl status "$service" --no-pager >>&2
+    systemctl status "$service" --no-pager >&2
     return 1
 }
 
