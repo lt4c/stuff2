@@ -76,20 +76,115 @@ else
     echo "[WARN] X11 socket not found: $X11_SOCKET"
 fi
 
-# Install required packages for GPU and display support
-echo "[INFO] Installing required packages for GPU and display support..."
-apt update >/dev/null 2>&1 || true
-apt install -y mesa-utils mesa-va-drivers mesa-vdpau-drivers vainfo \
-    libva2 libva-drm2 libva-x11-2 libvdpau1 vdpau-driver-all \
-    xserver-xorg-video-all libgl1-mesa-dri libglx-mesa0 \
-    libegl1-mesa libgbm1 libdrm2 >/dev/null 2>&1 || true
+# Detect NVIDIA Tesla T4 and Hyper-V environment
+NVIDIA_T4_DETECTED=false
+HYPERV_DETECTED=false
+NVIDIA_CARD=""
 
-# Install Hyper-V specific drivers if running in Hyper-V
-if lspci | grep -i "microsoft.*hyper-v" >/dev/null 2>&1; then
-    echo "[INFO] Detected Hyper-V environment, installing specific drivers..."
+# Check for Hyper-V
+if lspci | grep -i "microsoft.*hyper-v\|hyperv" >/dev/null 2>&1; then
+    HYPERV_DETECTED=true
+    echo "[INFO] Hyper-V environment detected"
+fi
+
+# Detect NVIDIA GPU
+if lspci | grep -i "tesla t4\|t4.*tesla\|nvidia" >/dev/null 2>&1; then
+    NVIDIA_T4_DETECTED=true
+    echo "[INFO] NVIDIA GPU detected via lspci"
+elif nvidia-smi 2>/dev/null | grep -i "tesla t4\|nvidia" >/dev/null 2>&1; then
+    NVIDIA_T4_DETECTED=true
+    echo "[INFO] NVIDIA GPU detected via nvidia-smi"
+fi
+
+# Find the correct NVIDIA card
+if [ "$NVIDIA_T4_DETECTED" = true ]; then
+    # Find nvidia-drm card
+    for card in /dev/dri/card*; do
+        if [ -e "$card" ]; then
+            DRIVER=$(udevadm info --query=property --name="$card" 2>/dev/null | grep "ID_PATH_TAG" | cut -d= -f2)
+            CARD_NAME=$(udevadm info --query=property --name="$card" 2>/dev/null | grep "DRIVER" | cut -d= -f2)
+            if echo "$CARD_NAME" | grep -q "nvidia"; then
+                NVIDIA_CARD="$card"
+                echo "[INFO] Found NVIDIA card: $NVIDIA_CARD"
+                break
+            fi
+        fi
+    done
+fi
+
+# Install required packages based on detected hardware
+echo "[INFO] Installing GPU and display support packages..."
+apt update >/dev/null 2>&1 || true
+
+# Install NVIDIA drivers and CUDA if Tesla T4 detected
+if [ "$NVIDIA_T4_DETECTED" = true ]; then
+    echo "[INFO] Installing NVIDIA Tesla T4 drivers and CUDA toolkit..."
+    
+    # Add NVIDIA repository
+    if [ ! -f /etc/apt/sources.list.d/graphics-drivers-ubuntu-ppa-*.list ]; then
+        add-apt-repository -y ppa:graphics-drivers/ppa >/dev/null 2>&1 || true
+        apt update >/dev/null 2>&1 || true
+    fi
+    
+    # Install NVIDIA drivers and libraries
+    apt install -y nvidia-driver-535 nvidia-utils-535 nvidia-settings \
+        libnvidia-encode-535 libnvidia-decode-535 libnvidia-fbc1-535 \
+        libnvidia-ifr1-535 libnvidia-gl-535 nvidia-compute-utils-535 >/dev/null 2>&1 || true
+    
+    # Install CUDA toolkit if not present
+    if [ ! -f /usr/local/cuda/bin/nvcc ]; then
+        echo "[INFO] Installing CUDA toolkit..."
+        wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb -O /tmp/cuda-keyring.deb >/dev/null 2>&1 || true
+        dpkg -i /tmp/cuda-keyring.deb >/dev/null 2>&1 || true
+        apt update >/dev/null 2>&1 || true
+        apt install -y cuda-toolkit-12-2 cuda-drivers >/dev/null 2>&1 || true
+        rm -f /tmp/cuda-keyring.deb
+    fi
+    
+    # Enable and start NVIDIA persistence daemon
+    systemctl enable nvidia-persistenced >/dev/null 2>&1 || true
+    systemctl start nvidia-persistenced >/dev/null 2>&1 || true
+    
+    # Load NVIDIA modules
+    modprobe nvidia 2>/dev/null || true
+    modprobe nvidia-drm 2>/dev/null || true
+    modprobe nvidia-modeset 2>/dev/null || true
+    
+    # Enable NVIDIA DRM modeset (required for proper KMS support)
+    if [ ! -f /etc/modprobe.d/nvidia-drm.conf ]; then
+        echo "options nvidia-drm modeset=1" > /etc/modprobe.d/nvidia-drm.conf
+        echo "[INFO] Enabled NVIDIA DRM modeset"
+    fi
+    
+    # Configure NVIDIA for Hyper-V if both are detected
+    if [ "$HYPERV_DETECTED" = true ]; then
+        echo "[INFO] Configuring NVIDIA for Hyper-V environment..."
+        
+        # Disable Hyper-V synthetic video to prioritize NVIDIA
+        if [ -f /etc/modprobe.d/hyperv.conf ]; then
+            sed -i '/^blacklist hyperv_fb/d' /etc/modprobe.d/hyperv.conf 2>/dev/null || true
+        fi
+        echo "blacklist hyperv_fb" >> /etc/modprobe.d/hyperv.conf
+        
+        # Set NVIDIA as primary GPU
+        echo "[INFO] Setting NVIDIA as primary GPU..."
+    fi
+    
+    echo "[SUCCESS] NVIDIA Tesla T4 drivers installed"
+fi
+
+# Install Hyper-V specific drivers
+if [ "$HYPERV_DETECTED" = true ]; then
+    echo "[INFO] Installing Hyper-V specific drivers..."
     apt install -y xserver-xorg-video-fbdev linux-image-virtual \
         linux-tools-virtual linux-cloud-tools-virtual >/dev/null 2>&1 || true
 fi
+
+# Install Mesa and VA-API drivers for fallback
+apt install -y mesa-utils mesa-va-drivers mesa-vdpau-drivers vainfo \
+    libva2 libva-drm2 libva-x11-2 libvdpau1 vdpau-driver-all \
+    xserver-xorg-video-all libgl1-mesa-dri libglx-mesa0 \
+    libegl1-mesa libgbm1 libdrm2 libdrm-dev >/dev/null 2>&1 || true
 
 # Setup comprehensive uinput permissions for Sunshine virtual input devices
 echo "[INFO] Setting up comprehensive uinput permissions for virtual keyboard/mouse..."
@@ -279,10 +374,16 @@ SUNSHINE_CONFIG_DIR="/home/$DESKTOP_USER/.config/sunshine"
 mkdir -p "$SUNSHINE_CONFIG_DIR"
 chown "$DESKTOP_USER:$DESKTOP_USER" "$SUNSHINE_CONFIG_DIR"
 
-# Create Sunshine configuration to fix display and pairing issues
-echo "[INFO] Creating Sunshine configuration to fix display and pairing issues..."
-cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
-# Sunshine configuration to fix display and pairing issues
+# Create Tesla T4 specific configuration
+if [ "$NVIDIA_T4_DETECTED" = true ]; then
+    # Determine the correct adapter name
+    ADAPTER_NAME="/dev/dri/card0"
+    if [ -n "$NVIDIA_CARD" ]; then
+        ADAPTER_NAME="$NVIDIA_CARD"
+    fi
+    
+    cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
+# Sunshine configuration optimized for NVIDIA Tesla T4 in Hyper-V
 
 # Network and pairing configuration
 address_family = both
@@ -296,35 +397,75 @@ channels = 5
 cert = /home/$DESKTOP_USER/.config/sunshine/sunshine.cert
 pkey = /home/$DESKTOP_USER/.config/sunshine/sunshine.key
 
-# Display configuration
-capture = kms
-output_name = 0
+# Display capture configuration - Use X11 instead of KMS for Hyper-V + NVIDIA
+capture = x11
+encoder = software
+adapter_name = $ADAPTER_NAME
 
-# Force software encoding if hardware fails
+# Software encoding settings (fallback for compatibility)
 sw_preset = ultrafast
 sw_tune = zerolatency
-encoder = software
 
-# Audio configuration
-audio_sink = auto_null
-
-# Logging
+# Video quality settings
 min_log_level = info
-log_colorized = enabled
+fec_percentage = 20
+qp = 28
+bitrate = 20000
 
-# KMS specific settings
-kms_crtc_id = 0
-kms_connector_id = 31
+# Audio configuration - Fix PulseAudio issues
+audio_sink = 
+virtual_sink = sunshine-stereo
 
-# Disable problematic features
-nvenc = disabled
-vaapi = disabled
+# Performance optimizations
+capture_cursor = enabled
+
+# Display settings
+output_name = 0
 
 # Pairing settings
 pin_timeout = 120000
+
+# Disable problematic features in Hyper-V
+nvenc = disabled
+vaapi = disabled
+vdpau = disabled
 EOF
 
+    # Note: NVENC may not work properly with nvidia-drm in Hyper-V
+    # The error "GPU driver doesn't support universal planes" indicates
+    # that the NVIDIA driver in Hyper-V passthrough mode has limitations
+    echo "[WARN] NVIDIA Tesla T4 detected but may have limited KMS support in Hyper-V"
+    echo "[INFO] Using X11 capture mode for better compatibility"
+fi
+
 chown "$DESKTOP_USER:$DESKTOP_USER" "$SUNSHINE_CONFIG_DIR/sunshine.conf"
+
+# Configure PulseAudio for Sunshine
+echo "[INFO] Configuring PulseAudio for Sunshine..."
+
+# Create PulseAudio configuration for virtual sink
+mkdir -p "/home/$DESKTOP_USER/.config/pulse"
+cat > "/home/$DESKTOP_USER/.config/pulse/default.pa" <<'EOF'
+# Load default PulseAudio configuration
+.include /etc/pulse/default.pa
+
+# Create Sunshine virtual sink
+load-module module-null-sink sink_name=sunshine-stereo sink_properties=device.description="Sunshine-Virtual-Sink"
+
+# Set sunshine-stereo as default
+set-default-sink sunshine-stereo
+EOF
+
+chown -R "$DESKTOP_USER:$DESKTOP_USER" "/home/$DESKTOP_USER/.config/pulse"
+
+# Restart PulseAudio for the user
+su - "$DESKTOP_USER" -c "
+    pulseaudio --kill 2>/dev/null || true
+    sleep 1
+    pulseaudio --start --log-target=syslog 2>/dev/null || true
+" || true
+
+echo "[SUCCESS] PulseAudio configured for Sunshine"
 
 # Generate SSL certificates for Sunshine pairing
 echo "[INFO] Generating SSL certificates for Sunshine pairing..."
