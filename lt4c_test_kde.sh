@@ -17,21 +17,106 @@ export APT_LISTCHANGES_FRONTEND=none
 LOG="/var/log/a_sh_install.log"
 
 USER_NAME="${USER_NAME:-lt4c}"
-USER_PASS="${USER_PASS:-lt4c@2025}"
-VNC_PASS="${VNC_PASS:-lt4c}"
-GEOM="${GEOM:-1280x720}"
+
+# Generate secure passwords if not provided
+if [ -z "${USER_PASS:-}" ]; then
+    USER_PASS="$(openssl rand -base64 16)"
+    echo "[SECURITY] Generated password for $USER_NAME: $USER_PASS" | tee -a /root/lt4c-credentials.txt
+    chmod 600 /root/lt4c-credentials.txt
+else
+    USER_PASS="${USER_PASS}"
+fi
+
+if [ -z "${VNC_PASS:-}" ]; then
+    VNC_PASS="$(openssl rand -base64 12)"
+    echo "[SECURITY] Generated VNC password: $VNC_PASS" | tee -a /root/lt4c-credentials.txt
+    chmod 600 /root/lt4c-credentials.txt
+else
+    VNC_PASS="${VNC_PASS}"
+fi
+
+GEOM="${GEOM:-1920x1080}"
 VNC_PORT="${VNC_PORT:-5900}"
 SUN_HTTP_TLS_PORT="${SUN_HTTP_TLS_PORT:-47990}"
+
+# Multi-session configuration
+MAX_SESSIONS="${MAX_SESSIONS:-5}"
+ENABLE_MULTI_SESSION="${ENABLE_MULTI_SESSION:-true}"
+
+# NVIDIA Tesla T4 optimization flags
+NVIDIA_T4_OPTIMIZATIONS="${NVIDIA_T4_OPTIMIZATIONS:-true}"
 
 ENABLE_VIGEM="${ENABLE_VIGEM:-false}"
 SUN_DEB_URL="${SUN_DEB_URL:-}"
 
+# Logging and error handling
 step(){ echo "[BƯỚC] $*"; }
+
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG"
+    [ "$level" = "ERROR" ] && echo "$message" >&2
+}
+
+handle_error() {
+    local exit_code=$?
+    local line_no=$1
+    local command="$2"
+    if [ $exit_code -ne 0 ]; then
+        log ERROR "Command failed at line $line_no: $command (exit code: $exit_code)"
+        return $exit_code
+    fi
+    return 0
+}
+
+wait_for_service() {
+    local service=$1
+    local timeout=${2:-30}
+    local count=0
+    log INFO "Waiting for $service to start..."
+    while [ $count -lt $timeout ]; do
+        if systemctl is-active --quiet "$service"; then
+            log INFO "$service is running"
+            return 0
+        fi
+        sleep 1
+        ((count++))
+    done
+    log ERROR "$service failed to start within ${timeout}s"
+    systemctl status "$service" --no-pager >>&2
+    return 1
+}
+
+cleanup_on_exit() {
+    local exit_code=$?
+    log INFO "Cleaning up temporary files..."
+    rm -f /tmp/cuda-keyring.deb /tmp/sunshine.*.deb 2>/dev/null || true
+    [ -f "$LOG" ] && gzip -f "$LOG" 2>/dev/null || true
+    exit $exit_code
+}
+
+trap cleanup_on_exit EXIT INT TERM
 
 # =================== PREPARE ===================
 : >"$LOG"
-apt update -qq >>"$LOG" 2>&1 || true
-apt -y install tmux iproute2 >>"$LOG" 2>&1 || true
+log INFO "Starting system preparation"
+
+# Validate system requirements
+log INFO "Validating system requirements..."
+FREE_SPACE=$(df / | awk 'NR==2 {print $4}')
+if [ "$FREE_SPACE" -lt 10485760 ]; then
+    log ERROR "Insufficient disk space. Need at least 10GB free"
+    exit 1
+fi
+
+log INFO "Updating package lists"
+apt update -qq >>"$LOG" 2>&1 || handle_error $LINENO "apt update"
+
+log INFO "Installing essential tools"
+apt -y install tmux iproute2 >>"$LOG" 2>&1 || handle_error $LINENO "install essential tools"
 
 step "0/11 Chuẩn bị môi trường & công cụ cơ bản"
 mkdir -p /etc/needrestart/conf.d
@@ -126,16 +211,76 @@ usermod -aG video,render,audio,input,uinput "$USER_NAME" 2>/dev/null || true
 USER_UID="$(id -u "$USER_NAME")"
 
 # =================== DESKTOP + XRDP + TigerVNC ===================
-step "2/11 Cài KDE Plasma + XRDP + TigerVNC"
+step "2/11 Cài KDE Plasma + XRDP + TigerVNC + NVIDIA Tesla T4"
+
+# Install NVIDIA drivers and CUDA for Tesla T4
+if [[ "$NVIDIA_T4_OPTIMIZATIONS" == "true" ]]; then
+  step "2.1/11 Cài NVIDIA Tesla T4 drivers và CUDA"
+  
+  # Check if Tesla T4 is actually present
+  if lspci | grep -qi "tesla t4"; then
+    log INFO "Tesla T4 GPU detected, proceeding with driver installation"
+    
+    # Add NVIDIA repository
+    log INFO "Adding NVIDIA repository"
+    apt -y install software-properties-common >>"$LOG" 2>&1 || handle_error $LINENO "install software-properties-common"
+    add-apt-repository -y ppa:graphics-drivers/ppa >>"$LOG" 2>&1 || handle_error $LINENO "add nvidia ppa"
+    
+    # Update package lists
+    log INFO "Updating package lists for NVIDIA"
+    apt update >>"$LOG" 2>&1 || handle_error $LINENO "apt update after nvidia ppa"
+    
+    # Install NVIDIA driver and libraries in parallel
+    log INFO "Installing NVIDIA drivers and libraries (this may take several minutes)"
+    apt -y install nvidia-driver-535 nvidia-utils-535 libnvidia-encode-535 libnvidia-decode-535 >>"$LOG" 2>&1 &
+    NVIDIA_DRIVER_PID=$!
+    
+    # Download CUDA toolkit while driver installs
+    log INFO "Downloading CUDA toolkit"
+    if [ ! -f /tmp/cuda-keyring.deb ]; then
+      wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.0-1_all.deb -O /tmp/cuda-keyring.deb >>"$LOG" 2>&1 || log WARN "Failed to download CUDA keyring"
+    fi
+    
+    # Wait for driver installation
+    wait $NVIDIA_DRIVER_PID || log WARN "NVIDIA driver installation had warnings"
+    
+    # Install CUDA toolkit only if keyring downloaded successfully
+    if [ -f /tmp/cuda-keyring.deb ]; then
+      log INFO "Installing CUDA toolkit"
+      dpkg -i /tmp/cuda-keyring.deb >>"$LOG" 2>&1 || log WARN "CUDA keyring installation had warnings"
+      apt update >>"$LOG" 2>&1 || true
+      apt -y install cuda-toolkit-12-2 nvidia-gds >>"$LOG" 2>&1 || log WARN "CUDA toolkit installation had warnings"
+    else
+      log WARN "Skipping CUDA toolkit installation (download failed)"
+    fi
+    
+    # Configure NVIDIA persistence daemon
+    log INFO "Configuring NVIDIA persistence daemon"
+    if systemctl enable nvidia-persistenced >>"$LOG" 2>&1; then
+      log INFO "NVIDIA persistence daemon enabled"
+    else
+      log WARN "Could not enable NVIDIA persistence daemon"
+    fi
+    
+    log INFO "NVIDIA Tesla T4 drivers installed. Reboot may be required for full functionality"
+  else
+    log WARN "Tesla T4 GPU not detected, skipping NVIDIA driver installation"
+  fi
+fi
+
 apt -y install \
   kde-standard sddm xorg \
   xrdp xorgxrdp pulseaudio \
   tigervnc-standalone-server \
   remmina remmina-plugin-rdp remmina-plugin-vnc flatpak \
-  mesa-vulkan-drivers libgl1-mesa-dri libasound2 libpulse0 libxkbcommon0 >>"$LOG" 2>&1
+  mesa-vulkan-drivers libgl1-mesa-dri libasound2 libpulse0 libxkbcommon0 \
+  vainfo vdpauinfo nvidia-vaapi-driver >>"$LOG" 2>&1
 
 # Ensure xrdp is enabled and uses our startwm (Plasma session)
-systemctl enable --now xrdp >>"$LOG" 2>&1 || true
+log INFO "Enabling and starting XRDP service"
+systemctl enable xrdp >>"$LOG" 2>&1 || handle_error $LINENO "enable xrdp"
+systemctl start xrdp >>"$LOG" 2>&1 || handle_error $LINENO "start xrdp"
+wait_for_service xrdp 30 || log WARN "XRDP service may not be fully ready"
 
 # Configure XRDP for better reconnection handling
 XRDP_INI="/etc/xrdp/xrdp.ini"
@@ -283,7 +428,57 @@ EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/xstartup"
 chmod +x "/home/$USER_NAME/.vnc/xstartup"
 
-cat >/etc/systemd/system/vncserver@.service <<EOF
+# Create multi-session VNC configuration
+if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
+  # Create VNC service template for multiple sessions
+  cat >/etc/systemd/system/vncserver@.service <<EOF
+[Unit]
+Description=TigerVNC server on display :%i (user ${USER_NAME})
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+User=${USER_NAME}
+Group=${USER_NAME}
+WorkingDirectory=/home/${USER_NAME}
+Environment=HOME=/home/${USER_NAME}
+Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
+Environment=DISPLAY=:%i
+ExecStartPre=/bin/bash -c 'rm -f /tmp/.X%i-lock /tmp/.X11-unix/X%i'
+ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} -AlwaysShared -AcceptKeyEvents -AcceptPointerEvents -AcceptCutText -SendCutText -SecurityTypes None :%i
+ExecStop=/usr/bin/vncserver -kill :%i
+ExecStopPost=/bin/bash -c 'rm -f /tmp/.X%i-lock /tmp/.X11-unix/X%i'
+Restart=always
+RestartSec=3
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  # Create multi-session startup script
+  cat >/usr/local/bin/start-multi-vnc.sh <<EOF
+#!/bin/bash
+# Start multiple VNC sessions
+
+echo "[INFO] Starting \$MAX_SESSIONS VNC sessions..."
+
+for i in \$(seq 0 \$((MAX_SESSIONS-1))); do
+    echo "[INFO] Starting VNC session :\$i on port \$((5900+i))"
+    systemctl enable vncserver@\$i.service
+    systemctl start vncserver@\$i.service
+    sleep 2
+done
+
+echo "[INFO] VNC sessions started:"
+systemctl list-units --type=service --state=running | grep vncserver@ || echo "No VNC sessions running"
+EOF
+  chmod +x /usr/local/bin/start-multi-vnc.sh
+
+else
+  # Single session VNC (original configuration)
+  cat >/etc/systemd/system/vncserver@.service <<EOF
 [Unit]
 Description=TigerVNC server on display :%i (user ${USER_NAME})
 After=network-online.target
@@ -307,6 +502,7 @@ TimeoutStopSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
+fi
 
 # Create cleanup service for stale VNC/RDP sessions
 cat >/etc/systemd/system/vnc-rdp-cleanup.service <<EOF
@@ -351,9 +547,45 @@ AccuracySec=1min
 WantedBy=timers.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now vnc-rdp-cleanup.timer >>"$LOG" 2>&1 || true
-systemctl enable --now vncserver@0.service >>"$LOG" 2>&1 || true
+log INFO "Reloading systemd daemon"
+systemctl daemon-reload || handle_error $LINENO "systemd daemon-reload"
+
+log INFO "Enabling VNC/RDP cleanup timer"
+systemctl enable --now vnc-rdp-cleanup.timer >>"$LOG" 2>&1 || log WARN "Could not enable cleanup timer"
+
+# Start VNC sessions based on configuration
+if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
+  log INFO "Starting $MAX_SESSIONS VNC sessions in parallel"
+  
+  # Start all VNC sessions in parallel
+  for i in $(seq 0 $((MAX_SESSIONS-1))); do
+    (
+      systemctl enable vncserver@$i.service >>"$LOG" 2>&1
+      systemctl start vncserver@$i.service >>"$LOG" 2>&1
+    ) &
+  done
+  
+  # Wait for all background jobs
+  wait
+  
+  # Verify sessions started
+  log INFO "Verifying VNC sessions"
+  STARTED_SESSIONS=0
+  for i in $(seq 0 $((MAX_SESSIONS-1))); do
+    if systemctl is-active --quiet vncserver@$i.service; then
+      ((STARTED_SESSIONS++))
+      log INFO "VNC session $i started successfully on port $((5900+i))"
+    else
+      log WARN "VNC session $i failed to start"
+    fi
+  done
+  log INFO "Started $STARTED_SESSIONS/$MAX_SESSIONS VNC sessions"
+else
+  log INFO "Starting single VNC session"
+  systemctl enable vncserver@0.service >>"$LOG" 2>&1 || handle_error $LINENO "enable vncserver@0"
+  systemctl start vncserver@0.service >>"$LOG" 2>&1 || handle_error $LINENO "start vncserver@0"
+  wait_for_service vncserver@0 30 || log WARN "VNC service may not be fully ready"
+fi
 
 # Create VNC/RDP reconnection helper script
 cat >/usr/local/bin/vnc-rdp-reconnect.sh <<'EOF'
@@ -498,6 +730,116 @@ if ! dpkg -i "$TMP_DEB"; then
   dpkg -i "$TMP_DEB"
 fi
 rm -f "$TMP_DEB"
+
+# Configure Sunshine for NVIDIA Tesla T4 and multi-session support
+step "6.1.0/11 Cấu hình Sunshine cho NVIDIA Tesla T4 và multi-session"
+
+# Create Sunshine configuration directory
+SUNSHINE_CONFIG_DIR="/home/$USER_NAME/.config/sunshine"
+mkdir -p "$SUNSHINE_CONFIG_DIR"
+chown "$USER_NAME:$USER_NAME" "$SUNSHINE_CONFIG_DIR"
+
+# Create optimized Sunshine configuration for Tesla T4
+cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
+# Sunshine configuration optimized for NVIDIA Tesla T4 and multi-session
+
+# Network configuration
+address_family = both
+bind_address = 0.0.0.0
+port = 47989
+https_port = 47990
+ping_timeout = 30000
+
+# NVIDIA Tesla T4 hardware encoding configuration
+capture = nvfbc
+encoder = nvenc
+adapter_name = /dev/dri/card0
+
+# NVENC settings for Tesla T4
+nvenc_preset = p4
+nvenc_rc = cbr_hq
+nvenc_coder = h264
+nvenc_2pass = enabled
+
+# Video quality settings optimized for Tesla T4
+min_log_level = info
+channels = 5
+fec_percentage = 20
+qp = 28
+
+# Multi-session support
+upnp = disabled
+lan_encryption_mode = 1
+
+# Audio configuration
+audio_sink = pulse
+
+# Performance optimizations for Tesla T4
+sw_preset = ultrafast
+sw_tune = zerolatency
+
+# Display configuration
+output_name = 0
+EOF
+
+# Create Tesla T4 specific environment setup
+if [[ "$NVIDIA_T4_OPTIMIZATIONS" == "true" ]]; then
+  cat >> "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
+
+# Tesla T4 specific optimizations
+nvenc_spatial_aq = enabled
+nvenc_temporal_aq = enabled
+nvenc_realtime = enabled
+nvenc_multipass = qres
+nvenc_coder = auto
+
+# GPU memory and performance settings
+capture_cursor = enabled
+capture_display = auto
+EOF
+fi
+
+chown "$USER_NAME:$USER_NAME" "$SUNSHINE_CONFIG_DIR/sunshine.conf"
+
+# Create multi-session Sunshine launcher
+if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
+  cat > /usr/local/bin/sunshine-multi-session.sh <<EOF
+#!/bin/bash
+# Multi-session Sunshine launcher for Tesla T4
+
+echo "[INFO] Starting Sunshine multi-session support..."
+
+# Create session-specific configurations
+for i in \$(seq 0 \$((MAX_SESSIONS-1))); do
+    SESSION_DIR="/home/$USER_NAME/.config/sunshine-session-\$i"
+    mkdir -p "\$SESSION_DIR"
+    
+    # Copy base configuration
+    cp "$SUNSHINE_CONFIG_DIR/sunshine.conf" "\$SESSION_DIR/sunshine.conf"
+    
+    # Modify ports for each session
+    sed -i "s/port = 47989/port = \$((47989+i))/" "\$SESSION_DIR/sunshine.conf"
+    sed -i "s/https_port = 47990/https_port = \$((47990+i))/" "\$SESSION_DIR/sunshine.conf"
+    
+    # Set display for each session
+    sed -i "s/output_name = 0/output_name = \$i/" "\$SESSION_DIR/sunshine.conf"
+    
+    chown -R "$USER_NAME:$USER_NAME" "\$SESSION_DIR"
+    
+    echo "[INFO] Created Sunshine configuration for session \$i (ports \$((47989+i))/\$((47990+i)))"
+done
+
+echo "[INFO] Multi-session Sunshine configurations created"
+echo "[INFO] Sessions available on ports:"
+for i in \$(seq 0 \$((MAX_SESSIONS-1))); do
+    echo "  Session \$i: HTTP \$((47989+i)), HTTPS \$((47990+i))"
+done
+EOF
+  chmod +x /usr/local/bin/sunshine-multi-session.sh
+  
+  # Run the multi-session setup
+  /usr/local/bin/sunshine-multi-session.sh >>"$LOG" 2>&1 || true
+fi
 
 # Post-installation GLIBCXX verification for Sunshine and user lt4c
 step "6.1.1/11 Kiểm tra GLIBCXX sau khi cài Sunshine cho user ${USER_NAME}"
@@ -1099,31 +1441,111 @@ if [ -z "$IP" ] && command -v hostname >/dev/null 2>&1; then
 fi
 IP="${IP:-<no-ip-detected>}"
 
-echo "TigerVNC : ${IP}:${VNC_PORT}  (pass: ${VNC_PASS})"
-echo "XRDP     : ${IP}:3389        (user ${USER_NAME} / ${USER_PASS})"
-echo "Sunshine : https://${IP}:${SUN_HTTP_TLS_PORT}  (UI tự ký; auto-add Steam & Chromium)"
+echo ""
+echo "=========================================="
+echo "  INSTALLATION COMPLETE"
+echo "=========================================="
+echo ""
+
+# Display credentials
+echo "=== CREDENTIALS (IMPORTANT - SAVE THESE) ==="
+echo "User: ${USER_NAME}"
+echo "Password: ${USER_PASS}"
+echo "VNC Password: ${VNC_PASS}"
+echo ""
+echo "Credentials saved to: /root/lt4c-credentials.txt"
+echo ""
+
+# Display connection information
+if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
+  echo "=== MULTI-SESSION CONFIGURATION ==="
+  echo "VNC Sessions:"
+  for i in $(seq 0 $((MAX_SESSIONS-1))); do
+    if systemctl is-active --quiet vncserver@$i.service; then
+      echo "  ✓ Session $i: ${IP}:$((5900+i))  (pass: ${VNC_PASS})"
+    else
+      echo "  ✗ Session $i: FAILED TO START"
+    fi
+  done
+  echo ""
+  echo "XRDP: ${IP}:3389 (user ${USER_NAME} / ${USER_PASS})"
+  echo ""
+  echo "Sunshine Sessions:"
+  for i in $(seq 0 $((MAX_SESSIONS-1))); do
+    echo "  Session $i: https://${IP}:$((47990+i))"
+  done
+else
+  echo "TigerVNC : ${IP}:${VNC_PORT}  (pass: ${VNC_PASS})"
+  echo "XRDP     : ${IP}:3389        (user ${USER_NAME} / ${USER_PASS})"
+  echo "Sunshine : https://${IP}:${SUN_HTTP_TLS_PORT}  (UI tự ký; auto-add Steam & Chromium)"
+fi
+
+echo ""
 echo "Moonlight: Mở shortcut 'Moonlight (Sunshine Web UI)' trên Desktop để pair"
 echo ""
-echo "=== VNC/RDP RECONNECTION FIXES ==="
-echo "If you can't reconnect after disconnecting VNC/RDP:"
-echo "- Run: /usr/local/bin/vnc-rdp-reconnect.sh"
-echo "- Or restart services: /usr/local/bin/vnc-rdp-reconnect.sh both"
-echo "- Check status: /usr/local/bin/vnc-rdp-reconnect.sh status"
-echo "- Clean all sessions: /usr/local/bin/vnc-rdp-reconnect.sh clean"
+
+# Display Tesla T4 status
+if [[ "$NVIDIA_T4_OPTIMIZATIONS" == "true" ]] && lspci | grep -qi "tesla t4"; then
+  echo "=== NVIDIA TESLA T4 STATUS ==="
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    echo "✓ Hardware encoding: NVENC enabled"
+    echo "✓ Capture method: NVFBC (NVIDIA Frame Buffer Capture)"
+    echo "✓ Preset: P4 (balanced quality/performance)"
+    echo "✓ Rate control: CBR HQ (Constant Bitrate High Quality)"
+    echo "✓ Advanced features: Spatial/Temporal AQ, 2-pass encoding"
+    echo ""
+    echo "Check GPU status: nvidia-smi"
+    echo "Monitor encoding: nvidia-smi -q -d ENCODER"
+  else
+    echo "⚠ NVIDIA drivers installed but nvidia-smi not available"
+    echo "  A reboot may be required: sudo reboot"
+  fi
+  echo ""
+fi
+
+# Display management commands
+if [[ "$ENABLE_MULTI_SESSION" == "true" ]]; then
+  echo "=== MULTI-SESSION MANAGEMENT ==="
+  echo "Start all VNC sessions: /usr/local/bin/start-multi-vnc.sh"
+  echo "Configure Sunshine sessions: /usr/local/bin/sunshine-multi-session.sh"
+  echo "Check VNC sessions: systemctl status 'vncserver@*.service'"
+  echo ""
+fi
+
+echo "=== TROUBLESHOOTING COMMANDS ==="
+echo "VNC/RDP reconnection: /usr/local/bin/vnc-rdp-reconnect.sh"
+echo "Restart services: /usr/local/bin/vnc-rdp-reconnect.sh both"
+echo "Check status: /usr/local/bin/vnc-rdp-reconnect.sh status"
+echo "Clean all sessions: /usr/local/bin/vnc-rdp-reconnect.sh clean"
 echo ""
-echo "=== SUNSHINE RDP TESTING ==="
-echo "For RDP display testing, run: sudo -u ${USER_NAME} /usr/local/bin/sunshine-direct.sh"
-echo "This bypasses session management and should prevent shutdown issues."
+echo "Sunshine RDP testing: sudo -u ${USER_NAME} /usr/local/bin/sunshine-direct.sh"
+echo ""
+echo "View logs: zcat $LOG.gz | less"
+echo ""
 
-echo "---- DEBUG ----"
-ip -o -4 addr show up | awk '{print $2, $4}' || true
-ip route || true
-ss -ltnp | awk 'NR==1 || /:3389|:5900|:47990/' || true
-systemctl --no-pager --full status vncserver@0 | sed -n '1,25p' || true
-systemctl --no-pager --full status xrdp | sed -n '1,25p' || true
-systemctl --no-pager --full status sunshine | sed -n '1,25p' || true
-echo "--------------"
+echo "=== SYSTEM STATUS ==="
+echo "Network interfaces:"
+ip -o -4 addr show up | awk '{print "  " $2 ": " $4}' || true
+echo ""
+echo "Listening ports:"
+ss -tlnp | awk 'NR==1 || /:3389|:5900|:47990/ {print "  " $0}' || true
+echo ""
+echo "Service status:"
+for service in vncserver@0 xrdp sunshine; do
+    if systemctl is-active --quiet "$service" 2>/dev/null; then
+        echo "  ✓ $service: running"
+    else
+        echo "  ✗ $service: not running"
+    fi
+done
+echo ""
 
-gzip -f "$LOG" 2>/dev/null || true
+log INFO "Installation completed successfully"
+log INFO "Credentials saved to /root/lt4c-credentials.txt"
+log INFO "Log file compressed to $LOG.gz"
 
 step "11/11 DONE"
+echo ""
+echo "=========================================="
+echo "  Setup complete! You can now connect."
+echo "=========================================="
