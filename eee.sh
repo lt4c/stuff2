@@ -76,23 +76,11 @@ export XDG_SESSION_TYPE=x11
 export DESKTOP_SESSION=plasma
 export XDG_CURRENT_DESKTOP=KDE
 export KDE_FULL_SESSION=true
-if command -v dbus-run-session >/dev/null 2>&1; then
-  exec dbus-run-session -- /usr/bin/startplasma-x11
-fi
+[ -x /usr/bin/dbus-launch ] && eval $(/usr/bin/dbus-launch --exit-with-session)
 exec /usr/bin/startplasma-x11
 EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/xstartup"
 chmod +x "/home/$USER_NAME/.vnc/xstartup"
-
-cat >"/home/$USER_NAME/.vnc/config" <<EOF
-SecurityTypes=VNC
-Authentication=VNC
-AlwaysShared=1
-IdleTimeout=0
-DesktopSize=${GEOM}
-EOF
-chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/config"
-chmod 600 "/home/$USER_NAME/.vnc/config"
 
 cat >"/home/$USER_NAME/.xsession" <<'EOF'
 #!/bin/sh
@@ -111,32 +99,6 @@ EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.xsessionrc"
 chmod 644 "/home/$USER_NAME/.xsessionrc"
 
-install -d /etc/X11/xorg.conf.d
-cat >/etc/X11/xorg.conf.d/10-vnc-dummy.conf <<'EOF'
-Section "Monitor"
-    Identifier "VNCMonitor"
-    HorizSync 30-110
-    VertRefresh 50-150
-EndSection
-
-Section "Device"
-    Identifier "VNCDevice"
-    Driver "dummy"
-    VideoRam 256000
-EndSection
-
-Section "Screen"
-    Identifier "VNCScreen"
-    Device "VNCDevice"
-    Monitor "VNCMonitor"
-    DefaultDepth 24
-    SubSection "Display"
-        Depth 24
-        Modes "${GEOM}"
-    EndSubSection
-EndSection
-EOF
-
 cat >/etc/systemd/system/vncserver@.service <<EOF
 [Unit]
 Description=TigerVNC server on display :%i (user ${USER_NAME})
@@ -149,9 +111,7 @@ User=${USER_NAME}
 Group=${USER_NAME}
 WorkingDirectory=/home/${USER_NAME}
 Environment=HOME=/home/${USER_NAME}
-ExecStartPre=-/usr/bin/vncserver -kill :%i
-ExecStartPre=/bin/sh -c 'rm -f /tmp/.X11-unix/X%i /tmp/.X%i-lock'
-ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} -SecurityTypes=VNC -AlwaysShared :%i
+ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} :%i
 ExecStop=/usr/bin/vncserver -kill :%i
 Restart=on-failure
 RestartSec=2
@@ -160,8 +120,6 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-systemctl disable --now vncserver@0.service >>/dev/null 2>&1 || true
-systemctl disable --now vncserver@1.service >>/dev/null 2>&1 || true
 systemctl daemon-reload
 systemctl enable --now vncserver@${VNC_DISPLAY}.service || true
 
