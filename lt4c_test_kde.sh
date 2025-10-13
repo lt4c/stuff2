@@ -493,13 +493,17 @@ update-desktop-database /usr/share/applications || true
 su - "$USER_NAME" -c 'update-desktop-database ~/.local/share/applications || true' >>"$LOG" 2>&1 || true
 pkill -HUP plasmashell || true
 
-# =================== TCP low latency + optional ufw allow ===================
-step "9/11 Bật TCP low latency + mở cổng (nếu có ufw)"
+# =================== TCP low latency + ufw firewall setup ===================
+step "9/11 Bật TCP low latency + cài ufw + mở cổng"
 cat >/etc/sysctl.d/90-remote-desktop.conf <<'EOF'
 net.ipv4.tcp_low_latency = 1
 EOF
 sysctl --system >/dev/null 2>&1 || true
 
+# Install ufw (Uncomplicated Firewall)
+apt -y install ufw >>"$LOG" 2>&1 || true
+
+# Configure ufw firewall rules
 if command -v ufw >/dev/null 2>&1; then
   ufw allow 3389/tcp || true        # RDP port for Windows clients
   ufw allow ${VNC_PORT}/tcp || true
