@@ -25,38 +25,122 @@ echo ""
 
 # Step 1: Load uinput module
 echo "[STEP 1] Loading uinput kernel module..."
-if ! lsmod | grep -q "^uinput"; then
-    modprobe uinput
-    if lsmod | grep -q "^uinput"; then
-        echo "[SUCCESS] uinput module loaded"
-    else
-        echo "[ERROR] Failed to load uinput module"
-        exit 1
-    fi
-else
+
+# Check if module is already loaded
+if lsmod | grep -q "^uinput"; then
     echo "[INFO] uinput module already loaded"
+else
+    echo "[INFO] Attempting to load uinput module..."
+    
+    # Try to load the module
+    if modprobe uinput 2>&1; then
+        sleep 1
+        if lsmod | grep -q "^uinput"; then
+            echo "[SUCCESS] uinput module loaded"
+        else
+            echo "[WARN] modprobe succeeded but module not showing in lsmod"
+        fi
+    else
+        echo "[ERROR] modprobe uinput failed"
+        echo "[INFO] Checking if uinput is built into kernel..."
+        
+        # Check if uinput is built-in (not a module)
+        if [ -e /dev/uinput ] || [ -c /dev/uinput ]; then
+            echo "[INFO] uinput appears to be built into kernel (not a module)"
+            echo "[SUCCESS] This is OK - uinput is available"
+        elif grep -q "CONFIG_INPUT_UINPUT=y" /boot/config-$(uname -r) 2>/dev/null; then
+            echo "[INFO] uinput is built into kernel (CONFIG_INPUT_UINPUT=y)"
+            echo "[SUCCESS] This is OK - uinput is available"
+        else
+            echo "[ERROR] uinput not available as module or built-in"
+            echo "[ERROR] You may need to install kernel headers or recompile kernel"
+            echo ""
+            echo "Checking kernel configuration..."
+            if [ -f /boot/config-$(uname -r) ]; then
+                grep "CONFIG_INPUT_UINPUT" /boot/config-$(uname -r) || echo "CONFIG_INPUT_UINPUT not found in kernel config"
+            else
+                echo "Kernel config not found at /boot/config-$(uname -r)"
+            fi
+            echo ""
+            echo "Attempting to continue anyway..."
+        fi
+    fi
 fi
 
 # Step 2: Create uinput device if missing
 echo ""
 echo "[STEP 2] Checking uinput device..."
 if [ ! -e /dev/uinput ]; then
-    echo "[INFO] Creating /dev/uinput device node..."
-    mknod /dev/uinput c 10 223
+    echo "[INFO] /dev/uinput does not exist, creating device node..."
+    
+    # Try to create the device node
+    if mknod /dev/uinput c 10 223 2>/dev/null; then
+        echo "[SUCCESS] Created /dev/uinput device node"
+    else
+        echo "[WARN] mknod failed, trying alternative methods..."
+        
+        # Alternative 1: Check if it exists under a different name
+        if [ -e /dev/input/uinput ]; then
+            echo "[INFO] Found /dev/input/uinput, creating symlink..."
+            ln -sf /dev/input/uinput /dev/uinput
+        # Alternative 2: Try with full path
+        elif [ -e /dev/misc/uinput ]; then
+            echo "[INFO] Found /dev/misc/uinput, creating symlink..."
+            ln -sf /dev/misc/uinput /dev/uinput
+        else
+            echo "[ERROR] Cannot find or create uinput device"
+        fi
+    fi
 fi
 
 if [ -e /dev/uinput ]; then
     echo "[SUCCESS] /dev/uinput exists"
+    ls -l /dev/uinput
+elif [ -e /dev/input/uinput ]; then
+    echo "[INFO] Using /dev/input/uinput instead"
+    ls -l /dev/input/uinput
+    # Create symlink for compatibility
+    ln -sf /dev/input/uinput /dev/uinput 2>/dev/null || true
+elif [ -e /dev/misc/uinput ]; then
+    echo "[INFO] Using /dev/misc/uinput instead"
+    ls -l /dev/misc/uinput
+    # Create symlink for compatibility
+    ln -sf /dev/misc/uinput /dev/uinput 2>/dev/null || true
 else
-    echo "[ERROR] Failed to create /dev/uinput"
-    exit 1
+    echo "[ERROR] Cannot find uinput device anywhere"
+    echo "[INFO] Checking all possible locations..."
+    find /dev -name "*uinput*" 2>/dev/null || echo "No uinput device found"
+    echo ""
+    echo "[ERROR] This kernel may not have uinput support"
+    echo "[INFO] Attempting to continue with alternative input method..."
 fi
 
 # Step 3: Set permissions
 echo ""
-echo "[STEP 3] Setting permissions on /dev/uinput..."
-chmod 666 /dev/uinput
-chown root:input /dev/uinput
+echo "[STEP 3] Setting permissions on uinput device..."
+
+# Set permissions on all possible uinput locations
+for uinput_path in /dev/uinput /dev/input/uinput /dev/misc/uinput; do
+    if [ -e "$uinput_path" ]; then
+        echo "[INFO] Setting permissions on $uinput_path"
+        chmod 666 "$uinput_path" 2>/dev/null || echo "[WARN] Failed to chmod $uinput_path"
+        chown root:input "$uinput_path" 2>/dev/null || echo "[WARN] Failed to chown $uinput_path"
+    fi
+done
+
+# Verify at least one is accessible
+UINPUT_FOUND=false
+for uinput_path in /dev/uinput /dev/input/uinput /dev/misc/uinput; do
+    if [ -w "$uinput_path" ]; then
+        echo "[SUCCESS] $uinput_path is writable"
+        UINPUT_FOUND=true
+        break
+    fi
+done
+
+if [ "$UINPUT_FOUND" = false ]; then
+    echo "[ERROR] No writable uinput device found"
+fi
 
 # Step 4: Add user to required groups
 echo ""
