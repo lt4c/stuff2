@@ -99,13 +99,14 @@ EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.xsessionrc"
 chmod 644 "/home/$USER_NAME/.xsessionrc"
 
-# Create VNC configuration for dummy display
+# Create VNC configuration for shared display
 cat >"/home/$USER_NAME/.vnc/config" <<EOF
 geometry=${GEOM}
 depth=24
 desktopname=KDE-Plasma
 alwaysshared=1
 securitytypes=vncauth
+localhost=no
 EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/config"
 chmod 600 "/home/$USER_NAME/.vnc/config"
@@ -140,10 +141,22 @@ killall Xvnc 2>/dev/null || true
 systemctl daemon-reload
 systemctl enable --now vncserver@${VNC_DISPLAY}.service || true
 
-# Wait for VNC service to start
+# Wait for VNC service to start and verify
 sleep 5
 echo "VNC service status:"
 systemctl status vncserver@${VNC_DISPLAY}.service --no-pager -l || true
+
+# Force restart VNC if not working
+if ! ss -tlnp | grep -q ":${VNC_PORT}"; then
+    echo "VNC not listening, attempting restart..."
+    systemctl stop vncserver@${VNC_DISPLAY}.service || true
+    su - "$USER_NAME" -c 'vncserver -kill :* 2>/dev/null || true'
+    killall Xvnc 2>/dev/null || true
+    rm -f /tmp/.X11-unix/X${VNC_DISPLAY} /tmp/.X${VNC_DISPLAY}-lock 2>/dev/null || true
+    sleep 2
+    systemctl start vncserver@${VNC_DISPLAY}.service || true
+    sleep 3
+fi
 
 # Verify VNC is listening and display is available
 echo "Checking VNC display :${VNC_DISPLAY}..."
@@ -151,6 +164,8 @@ if ss -tlnp | grep -q ":${VNC_PORT}"; then
     echo "✓ VNC server listening on port ${VNC_PORT}"
 else
     echo "✗ VNC server not listening on port ${VNC_PORT}"
+    echo "Attempting manual VNC start..."
+    su - "$USER_NAME" -c "vncserver :${VNC_DISPLAY} -geometry ${GEOM} -depth 24 -localhost no" || true
 fi
 
 # Check if X display is running
@@ -160,10 +175,25 @@ else
     echo "✗ X display :${VNC_DISPLAY} is not accessible"
 fi
 
+# Test VNC connection locally
+echo "Testing VNC connection..."
+if command -v vncviewer >/dev/null 2>&1; then
+    timeout 5s vncviewer -passwd /home/${USER_NAME}/.vnc/passwd localhost:${VNC_DISPLAY} -ViewOnly -Shared >/dev/null 2>&1 && \
+        echo "✓ VNC connection test successful" || echo "✗ VNC connection test failed"
+else
+    echo "vncviewer not available for connection test"
+fi
+
+# Configure XRDP with Plasma Shared TigerVNC session
 XRDP_INI="/etc/xrdp/xrdp.ini"
+echo "Configuring XRDP for Plasma Shared TigerVNC..."
 if [[ -f "$XRDP_INI" ]]; then
-  if ! grep -q 'Plasma Shared TigerVNC' "$XRDP_INI" 2>/dev/null; then
-    cat <<EOF >>"$XRDP_INI"
+  # Remove any existing VNC sections to avoid conflicts
+  sed -i '/^\[.*VNC.*\]/,/^\[/{/^\[.*VNC.*\]/d; /^\[/!d;}' "$XRDP_INI" 2>/dev/null || true
+  sed -i '/^\[Plasma.*\]/,/^\[/{/^\[Plasma.*\]/d; /^\[/!d;}' "$XRDP_INI" 2>/dev/null || true
+  
+  # Add the Plasma Shared TigerVNC session
+  cat <<EOF >>"$XRDP_INI"
 
 [Plasma Shared TigerVNC]
 name=Plasma Shared TigerVNC
@@ -173,13 +203,22 @@ password=ask
 ip=127.0.0.1
 port=${VNC_PORT}
 EOF
+
+  # Set this as the default session
+  if grep -q '^autorun=' "$XRDP_INI" 2>/dev/null; then
+    sed -i 's/^autorun=.*/autorun=Plasma Shared TigerVNC/' "$XRDP_INI"
+  else
+    sed -i '/^\[Globals\]/a autorun=Plasma Shared TigerVNC' "$XRDP_INI"
   fi
+  
+  # Improve xrdp performance / compatibility
+  sed -i 's/^crypt_level=.*/crypt_level=low/' "$XRDP_INI" || true
+  sed -i 's/^max_bpp=.*/max_bpp=16/' "$XRDP_INI" || true
+  sed -i 's/^tcp_nodelay=.*/tcp_nodelay=yes/' "$XRDP_INI" || true
+  sed -i 's/^tcp_keepalive=.*/tcp_keepalive=yes/' "$XRDP_INI" || true
 fi
-# Improve xrdp performance / compatibility
-if [ -f /etc/xrdp/xrdp.ini ]; then
-  sed -i 's/^crypt_level=.*/crypt_level=low/' /etc/xrdp/xrdp.ini || true
-  sed -i 's/^max_bpp=.*/max_bpp=16/' /etc/xrdp/xrdp.ini || true
-fi
+
+echo "XRDP configuration completed. Restarting services..."
 systemctl restart xrdp || true
 
 cat >/etc/X11/Xwrapper.config <<'EOF'
@@ -534,6 +573,23 @@ if pgrep -u "${USER_NAME}" -x sunshine >/dev/null; then
 else
     echo "✗ No Sunshine process found for ${USER_NAME}"
 fi
+
+echo "========================================"
+echo "XRDP Session Configuration:"
+if grep -A 10 "\\[Plasma Shared TigerVNC\\]" /etc/xrdp/xrdp.ini 2>/dev/null; then
+    echo "✓ Plasma Shared TigerVNC session found in XRDP config"
+else
+    echo "✗ Plasma Shared TigerVNC session missing from XRDP config"
+fi
+
+echo "========================================"
+echo "Connection Instructions:"
+echo "1. VNC Direct: vnc://${IP:-0.0.0.0}:${VNC_PORT} (password: ${VNC_PASS})"
+echo "2. RDP to VNC: rdp://${IP:-0.0.0.0}:${RDP_PORT}"
+echo "   - Username: ${USER_NAME}"
+echo "   - Password: ${USER_PASS}"
+echo "   - Session: Select 'Plasma Shared TigerVNC'"
+echo "   - VNC Password: ${VNC_PASS}"
 
 echo "========================================"
 echo "Port status:"
