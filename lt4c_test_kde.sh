@@ -137,25 +137,67 @@ apt -y install \
 # Ensure xrdp is enabled and uses our startwm (Plasma session)
 systemctl enable --now xrdp >>"$LOG" 2>&1 || true
 
+# Configure XRDP for better reconnection handling
 XRDP_INI="/etc/xrdp/xrdp.ini"
 if [[ -f "$XRDP_INI" ]]; then
+  # Backup original config
+  cp "$XRDP_INI" "$XRDP_INI.backup" 2>/dev/null || true
+  
+  # Configure global XRDP settings for better reconnection
+  sed -i 's/^fork=.*/fork=true/' "$XRDP_INI" 2>/dev/null || true
+  sed -i 's/^tcp_nodelay=.*/tcp_nodelay=true/' "$XRDP_INI" 2>/dev/null || true
+  sed -i 's/^tcp_keepalive=.*/tcp_keepalive=true/' "$XRDP_INI" 2>/dev/null || true
+  sed -i 's/^use_fastpath=.*/use_fastpath=both/' "$XRDP_INI" 2>/dev/null || true
+  sed -i 's/^security_layer=.*/security_layer=negotiate/' "$XRDP_INI" 2>/dev/null || true
+  sed -i 's/^certificate=.*/certificate=/' "$XRDP_INI" 2>/dev/null || true
+  sed -i 's/^key_file=.*/key_file=/' "$XRDP_INI" 2>/dev/null || true
+  sed -i 's/^autorun=.*/autorun=Plasma Shared TigerVNC/' "$XRDP_INI" 2>/dev/null || true
+  
+  # Add reconnection-friendly VNC session configuration
   if ! grep -q 'Plasma Shared TigerVNC' "$XRDP_INI" 2>/dev/null; then
     cat <<EOF >>"$XRDP_INI"
 
 [Plasma Shared TigerVNC]
 name=Plasma Shared TigerVNC
 lib=libvnc.so
-username=.
-password=${VNC_PASS}
+username=ask
+password=ask
 ip=127.0.0.1
 port=${VNC_PORT}
+chansrvport=ask
+code=20
 EOF
   fi
-  if grep -q '^autorun=' "$XRDP_INI" 2>/dev/null; then
-    sed -i 's/^autorun=.*/autorun=Plasma Shared TigerVNC/' "$XRDP_INI"
-  else
-    sed -i '/^\[Globals\]/a autorun=Plasma Shared TigerVNC' "$XRDP_INI"
+  
+  # Add direct Plasma session as fallback
+  if ! grep -q 'Plasma Direct' "$XRDP_INI" 2>/dev/null; then
+    cat <<EOF >>"$XRDP_INI"
+
+[Plasma Direct]
+name=Plasma Direct
+lib=libxup.so
+username=ask
+password=ask
+ip=127.0.0.1
+port=-1
+code=10
+EOF
   fi
+fi
+
+# Configure XRDP session manager for better cleanup
+SESMAN_INI="/etc/xrdp/sesman.ini"
+if [[ -f "$SESMAN_INI" ]]; then
+  # Backup original config
+  cp "$SESMAN_INI" "$SESMAN_INI.backup" 2>/dev/null || true
+  
+  # Configure session management for reconnection
+  sed -i 's/^EnableUserWindowManager=.*/EnableUserWindowManager=true/' "$SESMAN_INI" 2>/dev/null || true
+  sed -i 's/^KillDisconnected=.*/KillDisconnected=false/' "$SESMAN_INI" 2>/dev/null || true
+  sed -i 's/^DisconnectedTimeLimit=.*/DisconnectedTimeLimit=0/' "$SESMAN_INI" 2>/dev/null || true
+  sed -i 's/^IdleTimeLimit=.*/IdleTimeLimit=0/' "$SESMAN_INI" 2>/dev/null || true
+  sed -i 's/^Policy=.*/Policy=Default/' "$SESMAN_INI" 2>/dev/null || true
+  sed -i 's/^MaxSessions=.*/MaxSessions=10/' "$SESMAN_INI" 2>/dev/null || true
 fi
 
 # =================== Steam/Chromium (Flatpak) + Heroic ===================
@@ -252,16 +294,185 @@ User=${USER_NAME}
 Group=${USER_NAME}
 WorkingDirectory=/home/${USER_NAME}
 Environment=HOME=/home/${USER_NAME}
-ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} :%i
+Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
+ExecStartPre=/bin/bash -c 'rm -f /tmp/.X%i-lock /tmp/.X11-unix/X%i'
+ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} -AlwaysShared -AcceptKeyEvents -AcceptPointerEvents -AcceptCutText -SendCutText :%i
 ExecStop=/usr/bin/vncserver -kill :%i
-Restart=on-failure
-RestartSec=2
+ExecStopPost=/bin/bash -c 'rm -f /tmp/.X%i-lock /tmp/.X11-unix/X%i'
+Restart=always
+RestartSec=3
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=10
 [Install]
 WantedBy=multi-user.target
 EOF
 
+# Create cleanup service for stale VNC/RDP sessions
+cat >/etc/systemd/system/vnc-rdp-cleanup.service <<EOF
+[Unit]
+Description=Cleanup stale VNC/RDP sessions and lock files
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c '
+# Clean up stale X11 lock files
+rm -f /tmp/.X*-lock
+# Clean up stale X11 sockets
+find /tmp/.X11-unix -name "X*" -type s -mtime +1 -delete 2>/dev/null || true
+# Clean up stale VNC processes
+pkill -f "Xvnc.*:0" 2>/dev/null || true
+# Clean up stale XRDP sessions
+pkill -f "xrdp-sesman" 2>/dev/null || true
+sleep 2
+# Restart services if needed
+systemctl is-active --quiet vncserver@0 || systemctl start vncserver@0
+systemctl is-active --quiet xrdp || systemctl start xrdp
+'
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Create timer for periodic cleanup
+cat >/etc/systemd/system/vnc-rdp-cleanup.timer <<EOF
+[Unit]
+Description=Run VNC/RDP cleanup every 5 minutes
+Requires=vnc-rdp-cleanup.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
+systemctl enable --now vnc-rdp-cleanup.timer >>"$LOG" 2>&1 || true
 systemctl enable --now vncserver@0.service >>"$LOG" 2>&1 || true
+
+# Create VNC/RDP reconnection helper script
+cat >/usr/local/bin/vnc-rdp-reconnect.sh <<'EOF'
+#!/bin/bash
+# VNC/RDP reconnection helper script
+
+echo "=== VNC/RDP Reconnection Helper ==="
+echo "This script fixes common reconnection issues"
+echo ""
+
+# Function to restart VNC service
+restart_vnc() {
+    echo "[INFO] Restarting VNC service..."
+    systemctl stop vncserver@0 2>/dev/null || true
+    sleep 2
+    
+    # Clean up stale files
+    rm -f /tmp/.X0-lock /tmp/.X11-unix/X0 2>/dev/null || true
+    
+    # Kill any remaining VNC processes
+    pkill -f "Xvnc.*:0" 2>/dev/null || true
+    sleep 1
+    
+    systemctl start vncserver@0
+    sleep 3
+    
+    if systemctl is-active --quiet vncserver@0; then
+        echo "[SUCCESS] VNC service restarted successfully"
+        echo "VNC available on port 5900"
+    else
+        echo "[ERROR] Failed to restart VNC service"
+        systemctl status vncserver@0 --no-pager -l
+    fi
+}
+
+# Function to restart XRDP service
+restart_xrdp() {
+    echo "[INFO] Restarting XRDP service..."
+    systemctl stop xrdp 2>/dev/null || true
+    sleep 2
+    
+    # Clean up stale XRDP sessions
+    pkill -f xrdp-sesman 2>/dev/null || true
+    pkill -f xrdp 2>/dev/null || true
+    sleep 1
+    
+    systemctl start xrdp
+    sleep 3
+    
+    if systemctl is-active --quiet xrdp; then
+        echo "[SUCCESS] XRDP service restarted successfully"
+        echo "RDP available on port 3389"
+    else
+        echo "[ERROR] Failed to restart XRDP service"
+        systemctl status xrdp --no-pager -l
+    fi
+}
+
+# Function to show connection status
+show_status() {
+    echo "=== CONNECTION STATUS ==="
+    echo "VNC Service: $(systemctl is-active vncserver@0)"
+    echo "XRDP Service: $(systemctl is-active xrdp)"
+    echo ""
+    
+    echo "=== LISTENING PORTS ==="
+    ss -tlnp | grep -E ':(5900|3389)' || echo "No VNC/RDP ports found listening"
+    echo ""
+    
+    echo "=== ACTIVE X11 DISPLAYS ==="
+    ls -la /tmp/.X11-unix/ 2>/dev/null || echo "No X11 sockets found"
+    echo ""
+    
+    echo "=== LOCK FILES ==="
+    ls -la /tmp/.X*-lock 2>/dev/null || echo "No X11 lock files found"
+}
+
+# Main menu
+case "${1:-menu}" in
+    vnc)
+        restart_vnc
+        ;;
+    rdp|xrdp)
+        restart_xrdp
+        ;;
+    both|all)
+        restart_vnc
+        echo ""
+        restart_xrdp
+        ;;
+    status)
+        show_status
+        ;;
+    clean)
+        echo "[INFO] Cleaning up stale sessions..."
+        systemctl stop vncserver@0 xrdp 2>/dev/null || true
+        sleep 2
+        rm -f /tmp/.X*-lock /tmp/.X11-unix/X* 2>/dev/null || true
+        pkill -f "Xvnc\|xrdp" 2>/dev/null || true
+        sleep 2
+        systemctl start vncserver@0 xrdp
+        echo "[INFO] Cleanup complete"
+        ;;
+    *)
+        echo "Usage: $0 {vnc|rdp|both|status|clean}"
+        echo ""
+        echo "Commands:"
+        echo "  vnc    - Restart VNC service only"
+        echo "  rdp    - Restart XRDP service only"  
+        echo "  both   - Restart both VNC and XRDP services"
+        echo "  status - Show connection status"
+        echo "  clean  - Clean up and restart all services"
+        echo ""
+        show_status
+        ;;
+esac
+EOF
+
+chmod +x /usr/local/bin/vnc-rdp-reconnect.sh
 
 # ---------------- Sunshine (.deb) + apps ----------------
 step "6/11 Install Sunshine (.deb) + auto-add Steam & Chromium"
@@ -892,6 +1103,13 @@ echo "TigerVNC : ${IP}:${VNC_PORT}  (pass: ${VNC_PASS})"
 echo "XRDP     : ${IP}:3389        (user ${USER_NAME} / ${USER_PASS})"
 echo "Sunshine : https://${IP}:${SUN_HTTP_TLS_PORT}  (UI tự ký; auto-add Steam & Chromium)"
 echo "Moonlight: Mở shortcut 'Moonlight (Sunshine Web UI)' trên Desktop để pair"
+echo ""
+echo "=== VNC/RDP RECONNECTION FIXES ==="
+echo "If you can't reconnect after disconnecting VNC/RDP:"
+echo "- Run: /usr/local/bin/vnc-rdp-reconnect.sh"
+echo "- Or restart services: /usr/local/bin/vnc-rdp-reconnect.sh both"
+echo "- Check status: /usr/local/bin/vnc-rdp-reconnect.sh status"
+echo "- Clean all sessions: /usr/local/bin/vnc-rdp-reconnect.sh clean"
 echo ""
 echo "=== SUNSHINE RDP TESTING ==="
 echo "For RDP display testing, run: sudo -u ${USER_NAME} /usr/local/bin/sunshine-direct.sh"
