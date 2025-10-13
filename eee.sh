@@ -26,7 +26,7 @@ apt install -y \
   xserver-xorg-core xserver-xorg-input-all xserver-xorg-video-dummy \
   sudo dbus-x11 xdg-utils desktop-file-utils dconf-cli binutils \
   flatpak remmina remmina-plugin-rdp remmina-plugin-vnc \
-  mesa-vulkan-drivers libgl1-mesa-dri libasound2 libpulse0 libxkbcommon0
+  mesa-vulkan-drivers libgl1-mesa-dri libasound2 libpulse0 libxkbcommon0 ufw
 apt --fix-broken install -y || true
 
 GLIBCXX_REQUIRED=("GLIBCXX_3.4.31" "GLIBCXX_3.4.32")
@@ -69,15 +69,30 @@ chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/passwd"
 chmod 600 "/home/$USER_NAME/.vnc/passwd"
 
 cat >"/home/$USER_NAME/.vnc/xstartup" <<'EOF'
-#!/bin/sh
+#!/bin/bash
+# VNC xstartup script for KDE Plasma on dummy display
 unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
+
+# Set up X11 environment
 export XDG_SESSION_TYPE=x11
 export DESKTOP_SESSION=plasma
 export XDG_CURRENT_DESKTOP=KDE
 export KDE_FULL_SESSION=true
-[ -x /usr/bin/dbus-launch ] && eval $(/usr/bin/dbus-launch --exit-with-session)
-exec /usr/bin/startplasma-x11
+export QT_QPA_PLATFORM=xcb
+export GDK_BACKEND=x11
+
+# Start D-Bus session
+if [ -x /usr/bin/dbus-launch ]; then
+    eval $(dbus-launch --sh-syntax --exit-with-session)
+fi
+
+# Start KDE Plasma
+if [ -x /usr/bin/startplasma-x11 ]; then
+    exec /usr/bin/startplasma-x11
+else
+    exec /usr/bin/startkde
+fi
 EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/xstartup"
 chmod +x "/home/$USER_NAME/.vnc/xstartup"
@@ -99,6 +114,17 @@ EOF
 chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.xsessionrc"
 chmod 644 "/home/$USER_NAME/.xsessionrc"
 
+# Create VNC configuration for dummy display
+cat >"/home/$USER_NAME/.vnc/config" <<EOF
+geometry=${GEOM}
+depth=24
+desktopname=KDE-Plasma
+alwaysshared=1
+securitytypes=vncauth
+EOF
+chown "$USER_NAME:$USER_NAME" "/home/$USER_NAME/.vnc/config"
+chmod 600 "/home/$USER_NAME/.vnc/config"
+
 cat >/etc/systemd/system/vncserver@.service <<EOF
 [Unit]
 Description=TigerVNC server on display :%i (user ${USER_NAME})
@@ -111,9 +137,10 @@ User=${USER_NAME}
 Group=${USER_NAME}
 WorkingDirectory=/home/${USER_NAME}
 Environment=HOME=/home/${USER_NAME}
+Environment=USER=${USER_NAME}
 ExecStartPre=-/usr/bin/vncserver -kill :%i
 ExecStartPre=/bin/sh -c 'rm -f /tmp/.X11-unix/X%i /tmp/.X%i-lock'
-ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} :%i
+ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} -depth 24 :%i
 ExecStop=/usr/bin/vncserver -kill :%i
 Restart=on-failure
 RestartSec=5
@@ -124,28 +151,63 @@ StartLimitIntervalSec=60
 WantedBy=multi-user.target
 EOF
 
+# Stop any existing VNC services
+systemctl stop vncserver@*.service 2>/dev/null || true
+systemctl disable vncserver@*.service 2>/dev/null || true
+
+# Clean up any existing VNC processes
+su - "$USER_NAME" -c 'vncserver -kill :* 2>/dev/null || true'
+killall Xvnc 2>/dev/null || true
+
+# Remove stale socket files
+rm -f /tmp/.X11-unix/X${VNC_DISPLAY} /tmp/.X${VNC_DISPLAY}-lock 2>/dev/null || true
+
 systemctl daemon-reload
 systemctl enable --now vncserver@${VNC_DISPLAY}.service || true
+
+# Wait for VNC service to start
+sleep 5
+echo "VNC service status:"
+systemctl status vncserver@${VNC_DISPLAY}.service --no-pager -l || true
+
+# Verify VNC is listening and display is available
+echo "Checking VNC display :${VNC_DISPLAY}..."
+if ss -tlnp | grep -q ":${VNC_PORT}"; then
+    echo "✓ VNC server listening on port ${VNC_PORT}"
+else
+    echo "✗ VNC server not listening on port ${VNC_PORT}"
+fi
+
+# Check if X display is running
+if su - "$USER_NAME" -c "DISPLAY=:${VNC_DISPLAY} xdpyinfo >/dev/null 2>&1"; then
+    echo "✓ X display :${VNC_DISPLAY} is accessible"
+else
+    echo "✗ X display :${VNC_DISPLAY} is not accessible"
+fi
 
 XRDP_INI="/etc/xrdp/xrdp.ini"
 if [[ -f "$XRDP_INI" ]]; then
   sed -i 's/^port=.*/port=3389/' "$XRDP_INI" || true
-  if ! grep -q '\[Plasma VNC\]' "$XRDP_INI" 2>/dev/null; then
-    cat <<EOF >>"$XRDP_INI"
+  # Remove existing VNC sections
+  sed -i '/^\[.*VNC.*\]/,/^\[/{ /^\[.*VNC.*\]/d; /^\[/!d; }' "$XRDP_INI" 2>/dev/null || true
+  
+  # Add shared VNC session configuration
+  cat <<EOF >>"$XRDP_INI"
 
-[Plasma VNC]
-name=Plasma VNC
+[Shared Desktop VNC]
+name=Shared Desktop VNC
 lib=libvnc.so
-username=.
-password=${VNC_PASS}
+username=ask
+password=ask
 ip=127.0.0.1
 port=${VNC_PORT}
 EOF
-  fi
+  
+  # Set autorun to use shared VNC session
   if grep -q '^autorun=' "$XRDP_INI" 2>/dev/null; then
-    sed -i 's/^autorun=.*/autorun=Plasma VNC/' "$XRDP_INI"
+    sed -i 's/^autorun=.*/autorun=Shared Desktop VNC/' "$XRDP_INI"
   else
-    sed -i '/^\[Globals\]/a autorun=Plasma VNC' "$XRDP_INI"
+    sed -i '/^\[Globals\]/a autorun=Shared Desktop VNC' "$XRDP_INI"
   fi
 fi
 systemctl restart xrdp || true
@@ -153,6 +215,34 @@ systemctl restart xrdp || true
 cat >/etc/X11/Xwrapper.config <<'EOF'
 allowed_users=anybody
 needs_root_rights=no
+EOF
+
+# Create dummy display configuration
+install -d /etc/X11/xorg.conf.d
+cat >/etc/X11/xorg.conf.d/10-dummy-display.conf <<EOF
+Section "Device"
+    Identifier "dummy_videocard"
+    Driver "dummy"
+    VideoRam 256000
+EndSection
+
+Section "Monitor"
+    Identifier "dummy_monitor"
+    HorizSync 28.0-80.0
+    VertRefresh 48.0-75.0
+    Modeline "${GEOM}" 85.25 1280 1344 1480 1680 720 723 728 759 -hsync +vsync
+EndSection
+
+Section "Screen"
+    Identifier "dummy_screen"
+    Device "dummy_videocard"
+    Monitor "dummy_monitor"
+    DefaultDepth 24
+    SubSection "Display"
+        Depth 24
+        Modes "${GEOM}"
+    EndSubSection
+EndSection
 EOF
 
 cat >"/etc/polkit-1/localauthority/50-local.d/45-allow-colord.pkla" <<'EOF'
@@ -197,13 +287,22 @@ exec /bin/sh /etc/X11/Xsession
 EOF
 chmod +x /etc/xrdp/startwm.sh
 
-if command -v ufw >/dev/null 2>&1; then
-  ufw allow 22/tcp || true      # SSH
-  ufw allow 3389/tcp || true    # RDP
-  ufw allow 5900/tcp || true    # VNC
-  ufw allow 47990/tcp || true   # Sunshine web UI
-  ufw --force enable || true
-fi
+# Configure UFW firewall
+echo "Configuring UFW firewall..."
+ufw --force reset || true
+ufw default deny incoming || true
+ufw default allow outgoing || true
+ufw allow 22/tcp || true      # SSH
+ufw allow 3389/tcp || true    # RDP  
+ufw allow 5900/tcp || true    # VNC
+ufw allow 5901/tcp || true    # VNC alternate
+ufw allow 47990/tcp || true   # Sunshine web UI
+ufw allow 47989/tcp || true   # Sunshine RTSP
+ufw allow 48010/tcp || true   # Sunshine HTTP
+ufw --force enable || true
+ufw reload || true
+echo "UFW status:"
+ufw status verbose || true
 
 flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
 flatpak -y --system install flathub org.chromium.Chromium
@@ -365,4 +464,11 @@ echo "Service status:"
 sudo systemctl is-active vncserver@${VNC_DISPLAY} && echo "✓ VNC server running" || echo "✗ VNC server failed"
 sudo systemctl is-active xrdp && echo "✓ XRDP server running" || echo "✗ XRDP server failed"
 su - "${USER_NAME}" -c 'systemctl --user is-active sunshine' && echo "✓ Sunshine running" || echo "✗ Sunshine failed"
+
+echo "========================================"
+echo "Port status:"
+ss -tlnp | grep -E ':(22|3389|5900|5901|47990)' || echo "No services listening on expected ports"
+echo "========================================"
+echo "VNC logs (last 10 lines):"
+tail -n 10 "/home/${USER_NAME}/.vnc/"*.log 2>/dev/null || echo "No VNC logs found"
 echo "========================================"
