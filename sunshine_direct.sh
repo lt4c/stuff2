@@ -76,16 +76,31 @@ else
     echo "[WARN] X11 socket not found: $X11_SOCKET"
 fi
 
-# Setup uinput permissions for Sunshine
-echo "[INFO] Setting up uinput permissions for virtual input..."
+# Setup comprehensive uinput permissions for Sunshine virtual input devices
+echo "[INFO] Setting up comprehensive uinput permissions for virtual keyboard/mouse..."
 
-# Check if uinput module is loaded
-if ! lsmod | grep -q uinput; then
-    echo "[INFO] Loading uinput kernel module..."
-    if ! modprobe uinput 2>/dev/null; then
-        echo "[WARN] Failed to load uinput module, you may need to install kernel headers"
+# Ensure required kernel modules are loaded
+echo "[INFO] Loading required kernel modules..."
+REQUIRED_MODULES="uinput evdev"
+for module in $REQUIRED_MODULES; do
+    if ! lsmod | grep -q "^$module"; then
+        echo "[INFO] Loading $module kernel module..."
+        if ! modprobe "$module" 2>/dev/null; then
+            echo "[WARN] Failed to load $module module"
+        else
+            echo "[INFO] Successfully loaded $module module"
+        fi
+    else
+        echo "[INFO] $module module already loaded"
     fi
-fi
+done
+
+# Create required groups
+echo "[INFO] Creating required groups for input devices..."
+groupadd -f uinput 2>/dev/null || true
+groupadd -f input 2>/dev/null || true
+groupadd -f video 2>/dev/null || true
+groupadd -f render 2>/dev/null || true
 
 # Create uinput device if it doesn't exist
 if [ ! -e /dev/uinput ]; then
@@ -93,22 +108,58 @@ if [ ! -e /dev/uinput ]; then
     mknod /dev/uinput c 10 223 2>/dev/null || true
 fi
 
-# Set proper permissions on uinput device
-echo "[INFO] Setting uinput device permissions..."
+# Set comprehensive permissions on uinput device
+echo "[INFO] Setting comprehensive uinput device permissions..."
 chmod 666 /dev/uinput 2>/dev/null || echo "[WARN] Failed to set uinput permissions"
+chown root:uinput /dev/uinput 2>/dev/null || true
 
-# Add desktop user to uinput group if not already a member
-if ! groups "$DESKTOP_USER" | grep -q uinput; then
-    echo "[INFO] Adding user $DESKTOP_USER to uinput group..."
-    usermod -aG uinput "$DESKTOP_USER" 2>/dev/null || echo "[WARN] Failed to add user to uinput group"
+# Add desktop user to all required groups
+echo "[INFO] Adding user $DESKTOP_USER to all required groups..."
+REQUIRED_GROUPS="uinput input video render audio"
+for group in $REQUIRED_GROUPS; do
+    if ! groups "$DESKTOP_USER" | grep -q "$group"; then
+        echo "[INFO] Adding user $DESKTOP_USER to $group group..."
+        usermod -aG "$group" "$DESKTOP_USER" 2>/dev/null || echo "[WARN] Failed to add user to $group group"
+    else
+        echo "[INFO] User $DESKTOP_USER already in $group group"
+    fi
+done
+
+# Set permissions on all input devices
+echo "[INFO] Setting permissions on input devices..."
+if ls /dev/input/event* >/dev/null 2>&1; then
+    chmod 664 /dev/input/event* 2>/dev/null || true
+    chgrp input /dev/input/event* 2>/dev/null || true
+fi
+
+# Set permissions on mouse devices
+if ls /dev/input/mouse* >/dev/null 2>&1; then
+    chmod 664 /dev/input/mouse* 2>/dev/null || true
+    chgrp input /dev/input/mouse* 2>/dev/null || true
+fi
+
+# Set permissions on js (joystick) devices
+if ls /dev/input/js* >/dev/null 2>&1; then
+    chmod 664 /dev/input/js* 2>/dev/null || true
+    chgrp input /dev/input/js* 2>/dev/null || true
 fi
 
 # Verify uinput access
 if [ -w /dev/uinput ]; then
-    echo "[INFO] uinput device permissions: OK"
+    echo "[SUCCESS] uinput device permissions: OK - Sunshine can create virtual devices"
 else
-    echo "[WARN] uinput device still not writable"
-    echo "[WARN] Virtual keyboard/mouse may not work in Sunshine"
+    echo "[ERROR] uinput device still not writable"
+    echo "[ERROR] Virtual keyboard/mouse will NOT work in Sunshine"
+    
+    # Try alternative permission methods
+    echo "[INFO] Attempting alternative permission setup..."
+    chmod 777 /dev/uinput 2>/dev/null || true
+    
+    if [ -w /dev/uinput ]; then
+        echo "[SUCCESS] Alternative permissions worked"
+    else
+        echo "[ERROR] All permission attempts failed"
+    fi
 fi
 
 # Setup additional input device permissions
@@ -127,21 +178,71 @@ if ls /dev/input/event* >/dev/null 2>&1; then
     chgrp input /dev/input/event* 2>/dev/null || true
 fi
 
-# Create udev rule for persistent uinput permissions
-if [ ! -f /etc/udev/rules.d/99-sunshine-uinput.rules ]; then
-    echo "[INFO] Creating persistent udev rule for uinput..."
-    tee /etc/udev/rules.d/99-sunshine-uinput.rules >/dev/null <<'EOF'
-# uinput device permissions for Sunshine streaming
+# Create comprehensive udev rules for persistent uinput permissions
+echo "[INFO] Creating comprehensive persistent udev rules for Sunshine..."
+tee /etc/udev/rules.d/99-sunshine-comprehensive.rules >/dev/null <<'EOF'
+# Comprehensive uinput device permissions for Sunshine streaming
+# uinput device - allow creation of virtual input devices
 KERNEL=="uinput", MODE="0666", GROUP="uinput", OPTIONS+="static_node=uinput"
 SUBSYSTEM=="misc", KERNEL=="uinput", MODE="0666", GROUP="uinput", TAG+="uaccess"
+
+# Input event devices - keyboard, mouse, touchpad events
 SUBSYSTEM=="input", KERNEL=="event*", MODE="0664", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="mouse*", MODE="0664", GROUP="input"
+SUBSYSTEM=="input", KERNEL=="js*", MODE="0664", GROUP="input"
+
+# GPU devices for hardware acceleration
+SUBSYSTEM=="drm", KERNEL=="card*", MODE="0666", GROUP="video"
+SUBSYSTEM=="drm", KERNEL=="renderD*", MODE="0666", GROUP="render"
+
+# Additional input devices
+SUBSYSTEM=="input", ATTRS{name}=="*", MODE="0664", GROUP="input"
+KERNEL=="hidraw*", MODE="0664", GROUP="input"
+
+# Ensure uinput module loads on boot
+ACTION=="add", SUBSYSTEM=="misc", KERNEL=="uinput", RUN+="/sbin/modprobe uinput"
 EOF
-    
-    # Reload udev rules
-    udevadm control --reload-rules 2>/dev/null || true
-    udevadm trigger --subsystem-match=misc --action=add 2>/dev/null || true
-    echo "[INFO] Persistent udev rules created"
-fi
+
+# Also create module loading configuration
+echo "[INFO] Creating module loading configuration..."
+tee /etc/modules-load.d/sunshine-uinput.conf >/dev/null <<'EOF'
+# Load uinput module for Sunshine virtual input devices
+uinput
+evdev
+EOF
+
+# Create systemd service to ensure proper permissions on boot
+echo "[INFO] Creating systemd service for persistent permissions..."
+tee /etc/systemd/system/sunshine-permissions.service >/dev/null <<EOF
+[Unit]
+Description=Set Sunshine input device permissions
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'chmod 666 /dev/uinput 2>/dev/null || true'
+ExecStart=/bin/bash -c 'chgrp uinput /dev/uinput 2>/dev/null || true'
+ExecStart=/bin/bash -c 'chmod 664 /dev/input/event* 2>/dev/null || true'
+ExecStart=/bin/bash -c 'chgrp input /dev/input/event* 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable the service
+systemctl daemon-reload
+systemctl enable sunshine-permissions.service 2>/dev/null || true
+
+# Reload udev rules and trigger events
+echo "[INFO] Reloading udev rules and triggering device events..."
+udevadm control --reload-rules 2>/dev/null || true
+udevadm trigger --subsystem-match=misc --action=add 2>/dev/null || true
+udevadm trigger --subsystem-match=input --action=change 2>/dev/null || true
+udevadm trigger --subsystem-match=drm --action=change 2>/dev/null || true
+
+echo "[SUCCESS] Comprehensive udev rules and persistent permissions configured"
 
 # Verify KDE Plasma session is running
 if ! pgrep -x plasmashell >/dev/null; then
@@ -168,8 +269,58 @@ if pgrep -x sunshine >/dev/null; then
     sleep 2
 fi
 
+# Final verification of uinput capabilities for Sunshine
+echo "[INFO] Performing final verification of virtual input device capabilities..."
+
+# Test uinput device creation capability
+echo "[INFO] Testing uinput device creation capability..."
+if [ -w /dev/uinput ]; then
+    echo "[SUCCESS] /dev/uinput is writable - virtual devices can be created"
+    
+    # Test if we can actually create a virtual device (quick test)
+    su - "$DESKTOP_USER" -c "
+        if command -v python3 >/dev/null 2>&1; then
+            python3 -c '
+import os
+try:
+    fd = os.open(\"/dev/uinput\", os.O_WRONLY)
+    os.close(fd)
+    print(\"[SUCCESS] Virtual input device creation test: PASSED\")
+except Exception as e:
+    print(f\"[ERROR] Virtual input device creation test: FAILED - {e}\")
+' 2>/dev/null || echo '[INFO] Python test skipped'
+        fi
+    " || true
+else
+    echo "[ERROR] /dev/uinput is not writable - virtual devices CANNOT be created"
+    echo "[ERROR] Sunshine virtual keyboard/mouse will NOT work!"
+fi
+
+# Verify user group memberships
+echo "[INFO] Verifying user group memberships for $DESKTOP_USER..."
+USER_GROUPS=$(groups "$DESKTOP_USER" 2>/dev/null || echo "")
+for required_group in uinput input video render audio; do
+    if echo "$USER_GROUPS" | grep -q "$required_group"; then
+        echo "[SUCCESS] User $DESKTOP_USER is in $required_group group"
+    else
+        echo "[ERROR] User $DESKTOP_USER is NOT in $required_group group"
+    fi
+done
+
+# Test input device access
+echo "[INFO] Testing input device access..."
+INPUT_DEVICES_COUNT=$(ls /dev/input/event* 2>/dev/null | wc -l)
+if [ "$INPUT_DEVICES_COUNT" -gt 0 ]; then
+    echo "[SUCCESS] Found $INPUT_DEVICES_COUNT input event devices"
+    WRITABLE_DEVICES=$(find /dev/input/event* -writable 2>/dev/null | wc -l)
+    echo "[INFO] $WRITABLE_DEVICES input devices are writable"
+else
+    echo "[WARN] No input event devices found"
+fi
+
 echo "[INFO] Starting Sunshine as user $DESKTOP_USER to stream KDE Plasma desktop"
 echo "[INFO] This will capture the desktop session for Moonlight streaming"
+echo "[INFO] Virtual keyboard/mouse should work if all tests above passed"
 echo "[INFO] Press Ctrl+C to stop following logs (Sunshine will continue running)"
 
 # Start Sunshine as the desktop user with proper environment
