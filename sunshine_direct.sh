@@ -76,6 +76,21 @@ else
     echo "[WARN] X11 socket not found: $X11_SOCKET"
 fi
 
+# Install required packages for GPU and display support
+echo "[INFO] Installing required packages for GPU and display support..."
+apt update >/dev/null 2>&1 || true
+apt install -y mesa-utils mesa-va-drivers mesa-vdpau-drivers vainfo \
+    libva2 libva-drm2 libva-x11-2 libvdpau1 vdpau-driver-all \
+    xserver-xorg-video-all libgl1-mesa-dri libglx-mesa0 \
+    libegl1-mesa libgbm1 libdrm2 >/dev/null 2>&1 || true
+
+# Install Hyper-V specific drivers if running in Hyper-V
+if lspci | grep -i "microsoft.*hyper-v" >/dev/null 2>&1; then
+    echo "[INFO] Detected Hyper-V environment, installing specific drivers..."
+    apt install -y xserver-xorg-video-fbdev linux-image-virtual \
+        linux-tools-virtual linux-cloud-tools-virtual >/dev/null 2>&1 || true
+fi
+
 # Setup comprehensive uinput permissions for Sunshine virtual input devices
 echo "[INFO] Setting up comprehensive uinput permissions for virtual keyboard/mouse..."
 
@@ -244,6 +259,86 @@ udevadm trigger --subsystem-match=drm --action=change 2>/dev/null || true
 
 echo "[SUCCESS] Comprehensive udev rules and persistent permissions configured"
 
+# Fix GPU and display issues for Sunshine
+echo "[INFO] Configuring GPU and display settings for Sunshine..."
+
+# Set proper permissions on DRI devices
+echo "[INFO] Setting permissions on DRI devices..."
+if ls /dev/dri/card* >/dev/null 2>&1; then
+    chmod 666 /dev/dri/card* 2>/dev/null || true
+    chgrp video /dev/dri/card* 2>/dev/null || true
+fi
+
+if ls /dev/dri/renderD* >/dev/null 2>&1; then
+    chmod 666 /dev/dri/renderD* 2>/dev/null || true
+    chgrp render /dev/dri/renderD* 2>/dev/null || true
+fi
+
+# Create Sunshine configuration directory and config
+SUNSHINE_CONFIG_DIR="/home/$DESKTOP_USER/.config/sunshine"
+mkdir -p "$SUNSHINE_CONFIG_DIR"
+chown "$DESKTOP_USER:$DESKTOP_USER" "$SUNSHINE_CONFIG_DIR"
+
+# Create Sunshine configuration to fix display and encoding issues
+echo "[INFO] Creating Sunshine configuration to fix display issues..."
+cat > "$SUNSHINE_CONFIG_DIR/sunshine.conf" <<EOF
+# Sunshine configuration to fix display and encoding issues
+
+# Display configuration
+capture = kms
+output_name = 0
+
+# Force software encoding if hardware fails
+sw_preset = ultrafast
+sw_tune = zerolatency
+
+# Network configuration
+ping_timeout = 30000
+channels = 5
+
+# Audio configuration
+audio_sink = auto_null
+
+# Virtual display configuration
+min_log_level = info
+
+# Force specific encoder order (software fallback)
+encoder = software
+
+# KMS specific settings
+kms_crtc_id = 0
+kms_connector_id = 31
+
+# Disable problematic features
+nvenc = disabled
+vaapi = disabled
+EOF
+
+chown "$DESKTOP_USER:$DESKTOP_USER" "$SUNSHINE_CONFIG_DIR/sunshine.conf"
+
+# Create X11 wrapper script to ensure proper display detection
+echo "[INFO] Creating X11 display wrapper for Sunshine..."
+cat > "/usr/local/bin/sunshine-x11-wrapper.sh" <<'EOF'
+#!/bin/bash
+# X11 wrapper for Sunshine to ensure proper display detection
+
+# Set up X11 environment
+export DISPLAY="${DISPLAY:-:0}"
+export XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}"
+
+# Enable X11 forwarding for all users
+xhost +local: 2>/dev/null || true
+
+# Set up DRI environment
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_LOADER_DRIVER_OVERRIDE=swrast
+
+# Start Sunshine with proper environment
+exec /usr/bin/sunshine "$@"
+EOF
+
+chmod +x "/usr/local/bin/sunshine-x11-wrapper.sh"
+
 # Verify KDE Plasma session is running
 if ! pgrep -x plasmashell >/dev/null; then
     echo "[WARN] KDE Plasma (plasmashell) not detected!"
@@ -323,7 +418,18 @@ echo "[INFO] This will capture the desktop session for Moonlight streaming"
 echo "[INFO] Virtual keyboard/mouse should work if all tests above passed"
 echo "[INFO] Press Ctrl+C to stop following logs (Sunshine will continue running)"
 
-# Start Sunshine as the desktop user with proper environment
+# Configure network settings for Sunshine
+echo "[INFO] Configuring network settings for Sunshine..."
+
+# Open firewall ports for Sunshine
+if command -v ufw >/dev/null 2>&1; then
+    echo "[INFO] Opening firewall ports for Sunshine..."
+    ufw allow 47984:47990/tcp >/dev/null 2>&1 || true
+    ufw allow 47998:48010/udp >/dev/null 2>&1 || true
+    ufw allow 48100:48200/tcp >/dev/null 2>&1 || true
+fi
+
+# Start Sunshine as the desktop user with comprehensive environment
 su - "$DESKTOP_USER" -c "
 export DISPLAY='$DETECTED_DISPLAY'
 export XDG_RUNTIME_DIR='$DESKTOP_XDG_RUNTIME_DIR'
@@ -336,7 +442,18 @@ export QT_QPA_PLATFORMTHEME='kde'
 export SYSTEMD_IGNORE_CHROOT=1
 export NO_AT_BRIDGE=1
 export DBUS_FATAL_WARNINGS=0
-nohup /usr/bin/sunshine > /tmp/sunshine-direct.log 2>&1 &
+
+# GPU and Mesa environment
+export LIBGL_ALWAYS_SOFTWARE=1
+export MESA_LOADER_DRIVER_OVERRIDE=swrast
+export LIBVA_DRIVER_NAME=
+export VDPAU_DRIVER=
+
+# Enable X11 access
+xhost +local: 2>/dev/null || true
+
+# Start Sunshine with the X11 wrapper
+nohup /usr/local/bin/sunshine-x11-wrapper.sh > /tmp/sunshine-direct.log 2>&1 &
 echo \$!
 " > /tmp/sunshine-pid.tmp
 
@@ -355,6 +472,21 @@ echo "1. Open Moonlight on your client device"
 echo "2. Add PC manually with this IP"
 echo "3. Use the Web UI above to pair devices"
 echo "4. You should see KDE Plasma desktop (not terminal)"
+echo ""
+echo "=== TROUBLESHOOTING ==="
+echo "If you see 'Couldn't find monitor' errors:"
+echo "- This is normal in virtual environments (Hyper-V/VMware)"
+echo "- Sunshine will fall back to software encoding (libx264)"
+echo "- Performance may be lower but streaming should still work"
+echo ""
+echo "If you see 'Ping Timeout' errors:"
+echo "- Check firewall settings on both client and server"
+echo "- Ensure ports 47984-47990 (TCP) and 47998-48010 (UDP) are open"
+echo "- Try connecting from the same network first"
+echo ""
+echo "If virtual input doesn't work:"
+echo "- Check that uinput permissions were set correctly above"
+echo "- You may need to log out and back in for group changes"
 echo ""
 
 # Wait a moment for Sunshine to start
