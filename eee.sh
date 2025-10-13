@@ -111,10 +111,14 @@ User=${USER_NAME}
 Group=${USER_NAME}
 WorkingDirectory=/home/${USER_NAME}
 Environment=HOME=/home/${USER_NAME}
+ExecStartPre=-/usr/bin/vncserver -kill :%i
+ExecStartPre=/bin/sh -c 'rm -f /tmp/.X11-unix/X%i /tmp/.X%i-lock'
 ExecStart=/usr/bin/vncserver -fg -localhost no -geometry ${GEOM} :%i
 ExecStop=/usr/bin/vncserver -kill :%i
 Restart=on-failure
-RestartSec=2
+RestartSec=5
+StartLimitBurst=3
+StartLimitIntervalSec=60
 
 [Install]
 WantedBy=multi-user.target
@@ -194,7 +198,11 @@ EOF
 chmod +x /etc/xrdp/startwm.sh
 
 if command -v ufw >/dev/null 2>&1; then
-  ufw disable || true
+  ufw allow 22/tcp || true      # SSH
+  ufw allow 3389/tcp || true    # RDP
+  ufw allow 5900/tcp || true    # VNC
+  ufw allow 47990/tcp || true   # Sunshine web UI
+  ufw --force enable || true
 fi
 
 flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo
@@ -252,6 +260,17 @@ groupadd -f input
 groupadd -f uinput
 usermod -aG input,uinput "${USER_NAME}"
 
+# Ensure proper uinput device permissions
+echo 'KERNEL=="uinput", MODE="0660", GROUP="uinput", OPTIONS+="static_node=uinput"' > /etc/udev/rules.d/99-uinput.rules
+echo 'SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"' >> /etc/udev/rules.d/99-uinput.rules
+
+# Create uinput device node if it doesn't exist
+if [ ! -e /dev/uinput ]; then
+  mknod /dev/uinput c 10 223 || true
+fi
+chgrp uinput /dev/uinput 2>/dev/null || true
+chmod 660 /dev/uinput 2>/dev/null || true
+
 MODULE_CONF="/etc/modules-load.d/uinput.conf"
 if [[ -f "$MODULE_CONF" ]]; then
   if ! grep -qxF 'uinput' "$MODULE_CONF"; then
@@ -262,9 +281,11 @@ else
 fi
 modprobe uinput || true
 
+# Additional udev rules for Sunshine input handling
 cat >/etc/udev/rules.d/60-sunshine-input.rules <<'EOF'
 KERNEL=="uinput", MODE="0660", GROUP="uinput", OPTIONS+="static_node=uinput"
 SUBSYSTEM=="input", KERNEL=="event*", MODE="0660", GROUP="input"
+SUBSYSTEM=="misc", KERNEL=="uinput", MODE="0660", GROUP="uinput"
 EOF
 udevadm control --reload-rules || true
 udevadm trigger --subsystem-match=misc --action=add || true
@@ -293,7 +314,10 @@ ExecStart=/usr/bin/sunshine
 Restart=on-failure
 Environment=DISPLAY=:${VNC_DISPLAY}
 Environment=XDG_RUNTIME_DIR=/run/user/${USER_UID}
+Environment=XDG_SESSION_TYPE=x11
+Environment=WAYLAND_DISPLAY=
 SupplementaryGroups=input uinput
+PrivateDevices=no
 
 [Install]
 WantedBy=default.target
@@ -306,14 +330,39 @@ rm -f /etc/systemd/system/sunshine.service
 rm -rf /etc/systemd/system/sunshine.service.d
 systemctl disable --now /etc/systemd/system/sunshine.service >>/dev/null 2>&1 || true
 systemctl daemon-reload
+
+# Ensure user can access input devices
 su - "${USER_NAME}" -c 'systemctl --user daemon-reload'
+su - "${USER_NAME}" -c 'systemctl --user stop sunshine || true'
+sleep 3
+# Wait for user session to be ready
+for i in {1..10}; do
+  if su - "${USER_NAME}" -c 'systemctl --user is-active --quiet default.target' 2>/dev/null; then
+    break
+  fi
+  sleep 1
+done
 su - "${USER_NAME}" -c 'systemctl --user enable --now sunshine'
+
+# Verify uinput permissions
+echo "Checking uinput permissions for ${USER_NAME}..."
+su - "${USER_NAME}" -c 'groups | grep -q uinput && echo "User is in uinput group" || echo "WARNING: User not in uinput group"'
+su - "${USER_NAME}" -c 'test -w /dev/uinput && echo "User can write to /dev/uinput" || echo "WARNING: User cannot write to /dev/uinput"'
 
 IP="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 if [ -z "$IP" ]; then
   IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 fi
 
-echo "VNC available at ${IP:-0.0.0.0}:$VNC_PORT (password $VNC_PASS)"
-echo "RDP available at ${IP:-0.0.0.0}:$RDP_PORT (user $USER_NAME / $USER_PASS)"
-echo "Sunshine service active for $USER_NAME"
+echo "========================================"
+echo "Setup completed successfully!"
+echo "========================================"
+echo "VNC available at ${IP:-0.0.0.0}:$VNC_PORT (password: $VNC_PASS)"
+echo "RDP available at ${IP:-0.0.0.0}:$RDP_PORT (user: $USER_NAME / password: $USER_PASS)"
+echo "Sunshine Web UI: http://${IP:-0.0.0.0}:47990"
+echo "========================================"
+echo "Service status:"
+sudo systemctl is-active vncserver@${VNC_DISPLAY} && echo "✓ VNC server running" || echo "✗ VNC server failed"
+sudo systemctl is-active xrdp && echo "✓ XRDP server running" || echo "✗ XRDP server failed"
+su - "${USER_NAME}" -c 'systemctl --user is-active sunshine' && echo "✓ Sunshine running" || echo "✗ Sunshine failed"
+echo "========================================"
