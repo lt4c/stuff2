@@ -69,6 +69,46 @@ else
   echo "[INFO] libstdc++6 đã có ${GLIBCXX_REQUIRED}." >>"$LOG"
 fi
 
+# Verify GLIBCXX availability for user lt4c specifically
+step "0.1.2/11 Kiểm tra GLIBCXX cho user ${USER_NAME}"
+if id -u "$USER_NAME" >/dev/null 2>&1; then
+  # Test GLIBCXX availability as the target user
+  su - "$USER_NAME" -c "
+    echo '[INFO] Testing GLIBCXX availability for user $USER_NAME...'
+    LIBSTDCXX_USER_PATH=\"\$(ldconfig -p 2>/dev/null | awk '/libstdc\\\\+\\\\+\\.so\\.6/ {print \$4; exit}')\"
+    if [ -n \"\$LIBSTDCXX_USER_PATH\" ] && strings \"\$LIBSTDCXX_USER_PATH\" 2>/dev/null | grep -q '$GLIBCXX_REQUIRED'; then
+      echo '[INFO] GLIBCXX_3.4.32 available for user $USER_NAME'
+    else
+      echo '[WARN] GLIBCXX_3.4.32 not found for user $USER_NAME'
+      echo '[INFO] Updating library cache for user...'
+      ldconfig 2>/dev/null || true
+    fi
+  " >>"$LOG" 2>&1 || true
+  
+  # Ensure user has access to updated libraries
+  echo "[INFO] Ensuring user ${USER_NAME} has access to updated GLIBCXX libraries" >>"$LOG"
+  
+  # Update library cache and environment for the user
+  su - "$USER_NAME" -c "
+    # Update user library cache
+    ldconfig 2>/dev/null || true
+    
+    # Add library paths to user environment if needed
+    if [ ! -f ~/.bashrc ] || ! grep -q 'LD_LIBRARY_PATH' ~/.bashrc 2>/dev/null; then
+      echo '# Ensure access to updated libraries' >> ~/.bashrc
+      echo 'export LD_LIBRARY_PATH=\"/usr/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH\"' >> ~/.bashrc
+    fi
+    
+    # Test if Sunshine can find required symbols
+    if command -v sunshine >/dev/null 2>&1; then
+      echo '[INFO] Testing Sunshine GLIBCXX compatibility...'
+      timeout 5 sunshine --help >/dev/null 2>&1 && echo '[INFO] Sunshine GLIBCXX test: OK' || echo '[WARN] Sunshine GLIBCXX test: FAILED'
+    fi
+  " >>"$LOG" 2>&1 || true
+else
+  echo "[WARN] User ${USER_NAME} not found, skipping user-specific GLIBCXX verification" >>"$LOG"
+fi
+
 # Cleanup nếu trước đó đã có code/x11vnc
 apt -y purge code x11vnc >>"$LOG" 2>&1 || true
 systemctl disable --now x11vnc.service >>"$LOG" 2>&1 || true
@@ -247,6 +287,51 @@ if ! dpkg -i "$TMP_DEB"; then
   dpkg -i "$TMP_DEB"
 fi
 rm -f "$TMP_DEB"
+
+# Post-installation GLIBCXX verification for Sunshine and user lt4c
+step "6.1.1/11 Kiểm tra GLIBCXX sau khi cài Sunshine cho user ${USER_NAME}"
+echo "[INFO] Verifying Sunshine GLIBCXX compatibility for user ${USER_NAME}" >>"$LOG"
+
+# Test Sunshine execution as the target user
+su - "$USER_NAME" -c "
+  echo '[INFO] Testing Sunshine execution with GLIBCXX for user $USER_NAME...'
+  
+  # Set up library environment
+  export LD_LIBRARY_PATH=\"/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH\"
+  
+  # Test basic Sunshine functionality
+  if command -v sunshine >/dev/null 2>&1; then
+    echo '[INFO] Sunshine binary found, testing GLIBCXX compatibility...'
+    
+    # Try to run sunshine with version check (should not crash on GLIBCXX)
+    if timeout 10 sunshine --version 2>&1 | grep -i sunshine >/dev/null; then
+      echo '[SUCCESS] Sunshine GLIBCXX compatibility: OK'
+    else
+      echo '[ERROR] Sunshine GLIBCXX compatibility: FAILED'
+      echo '[INFO] Attempting to fix library paths...'
+      
+      # Add library paths to user profile
+      if [ -f ~/.profile ]; then
+        if ! grep -q 'LD_LIBRARY_PATH.*usr/lib/x86_64-linux-gnu' ~/.profile; then
+          echo 'export LD_LIBRARY_PATH=\"/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu:\$LD_LIBRARY_PATH\"' >> ~/.profile
+        fi
+      fi
+      
+      # Try again with explicit library path
+      export LD_LIBRARY_PATH=\"/usr/lib/x86_64-linux-gnu:/lib/x86_64-linux-gnu\"
+      if timeout 10 sunshine --version 2>&1 | grep -i sunshine >/dev/null; then
+        echo '[SUCCESS] Sunshine GLIBCXX compatibility: FIXED'
+      else
+        echo '[ERROR] Sunshine GLIBCXX compatibility: STILL FAILED'
+      fi
+    fi
+  else
+    echo '[ERROR] Sunshine binary not found in PATH'
+  fi
+" >>"$LOG" 2>&1 || true
+
+# Ensure system-wide library cache is updated
+ldconfig >>"$LOG" 2>&1 || true
 
 # apps.json (stream targets)
 read -r -d '' APPS_JSON_CONTENT <<JSON
