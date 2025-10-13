@@ -156,24 +156,81 @@ echo "[SUCCESS] Udev rules created and loaded"
 echo ""
 
 # ============================================
-# STEP 7: Test virtual device creation
+# STEP 7: Test virtual device creation (CRITICAL)
 # ============================================
 echo "[STEP 7/8] Testing virtual device creation..."
 echo "---"
+echo "[INFO] This is the CRITICAL test - if this fails, Sunshine cannot create keyboard/mouse"
+echo ""
 
-# Test as the desktop user
+# First, verify basic file access
+echo "[TEST 1/4] Checking basic /dev/uinput access..."
+if su - "$DESKTOP_USER" -c "test -w /dev/uinput"; then
+    echo "[SUCCESS] ✓ User can write to /dev/uinput"
+else
+    echo "[ERROR] ✗ User CANNOT write to /dev/uinput"
+    echo "[FIX] Applying maximum permissions..."
+    chmod 777 /dev/uinput
+    chown root:input /dev/uinput
+    
+    if su - "$DESKTOP_USER" -c "test -w /dev/uinput"; then
+        echo "[SUCCESS] ✓ Fixed - user can now write to /dev/uinput"
+    else
+        echo "[ERROR] ✗ Still cannot write - CRITICAL FAILURE"
+        ls -l /dev/uinput
+        groups "$DESKTOP_USER"
+        exit 1
+    fi
+fi
+echo ""
+
+# Second, test Python evdev library
+echo "[TEST 2/4] Checking Python evdev library..."
+if su - "$DESKTOP_USER" -c "python3 -c 'import evdev' 2>/dev/null"; then
+    echo "[SUCCESS] ✓ evdev library is available"
+else
+    echo "[ERROR] ✗ evdev library missing"
+    echo "[FIX] Installing python3-evdev..."
+    apt install -y python3-evdev libevdev2 2>/dev/null || {
+        echo "[ERROR] Failed to install evdev"
+        echo "[INFO] Trying pip install..."
+        su - "$DESKTOP_USER" -c "pip3 install evdev --user" 2>/dev/null || true
+    }
+    
+    if su - "$DESKTOP_USER" -c "python3 -c 'import evdev' 2>/dev/null"; then
+        echo "[SUCCESS] ✓ evdev library now available"
+    else
+        echo "[ERROR] ✗ Cannot install evdev - Sunshine may not work"
+    fi
+fi
+echo ""
+
+# Third, test actual virtual device creation
+echo "[TEST 3/4] Testing virtual keyboard creation..."
 TEST_RESULT=$(su - "$DESKTOP_USER" -c '
 python3 << "PYTEST"
 import sys
 try:
     from evdev import UInput, ecodes
     
-    # Try to create a virtual keyboard
-    ui = UInput(name="Test Virtual Keyboard")
-    print("SUCCESS")
+    # Create a virtual keyboard with explicit capabilities
+    capabilities = {
+        ecodes.EV_KEY: [
+            ecodes.KEY_A, ecodes.KEY_B, ecodes.KEY_C,
+            ecodes.KEY_ENTER, ecodes.KEY_ESC
+        ]
+    }
+    
+    ui = UInput(capabilities, name="Sunshine-Test-Keyboard")
+    print("SUCCESS: Created virtual keyboard")
+    print(f"Device: {ui.device.path}")
     ui.close()
+    
 except PermissionError as e:
     print(f"PERMISSION_ERROR: {e}")
+    sys.exit(1)
+except OSError as e:
+    print(f"OS_ERROR: {e}")
     sys.exit(1)
 except Exception as e:
     print(f"ERROR: {e}")
@@ -182,24 +239,117 @@ PYTEST
 ' 2>&1)
 
 if echo "$TEST_RESULT" | grep -q "SUCCESS"; then
-    echo "[SUCCESS] ✓ Virtual device creation test PASSED"
-    echo "[SUCCESS] ✓ Sunshine will be able to create keyboard/mouse devices"
+    echo "[SUCCESS] ✓ Virtual keyboard creation WORKS!"
+    echo "$TEST_RESULT" | grep "Device:"
 else
-    echo "[ERROR] ✗ Virtual device creation test FAILED"
+    echo "[ERROR] ✗ Virtual keyboard creation FAILED"
     echo "[ERROR] Output: $TEST_RESULT"
     echo ""
-    echo "[INFO] Attempting workaround..."
-    # Try even more permissive settings
-    chmod 777 /dev/uinput
     
-    # Test again
-    if su - "$DESKTOP_USER" -c 'python3 -c "from evdev import UInput; ui = UInput(); ui.close()" 2>/dev/null'; then
-        echo "[SUCCESS] Workaround successful"
-    else
-        echo "[ERROR] Virtual device creation still failing"
-        echo "[ERROR] Check: ls -l /dev/uinput"
-        echo "[ERROR] Check: groups $DESKTOP_USER"
+    # Diagnose the specific error
+    if echo "$TEST_RESULT" | grep -q "PERMISSION_ERROR"; then
+        echo "[DIAGNOSIS] Permission denied - uinput not accessible"
+        echo "[FIX] Applying nuclear option - world-writable uinput..."
+        chmod 777 /dev/uinput
+        setfacl -m u:$DESKTOP_USER:rw /dev/uinput 2>/dev/null || true
+        
+    elif echo "$TEST_RESULT" | grep -q "OS_ERROR"; then
+        echo "[DIAGNOSIS] OS error - kernel may not support uinput"
+        echo "[INFO] Checking kernel config..."
+        if [ -f /boot/config-$(uname -r) ]; then
+            grep CONFIG_INPUT_UINPUT /boot/config-$(uname -r) || echo "CONFIG_INPUT_UINPUT not found"
+        fi
+        
+    elif echo "$TEST_RESULT" | grep -q "No module named"; then
+        echo "[DIAGNOSIS] Python evdev module not found"
+        echo "[FIX] Installing via pip..."
+        su - "$DESKTOP_USER" -c "pip3 install evdev --user --break-system-packages" 2>/dev/null || true
     fi
+    
+    # Retry after fixes
+    echo ""
+    echo "[RETRY] Testing again after fixes..."
+    if su - "$DESKTOP_USER" -c 'python3 -c "from evdev import UInput; ui = UInput(); ui.close(); print(\"SUCCESS\")" 2>/dev/null' | grep -q "SUCCESS"; then
+        echo "[SUCCESS] ✓ Virtual device creation now WORKS!"
+    else
+        echo "[ERROR] ✗ Still failing - this will prevent Sunshine input from working"
+        echo ""
+        echo "[MANUAL DEBUG] Run these commands to diagnose:"
+        echo "  sudo -u $DESKTOP_USER python3 -c 'from evdev import UInput; ui = UInput()'"
+        echo "  ls -l /dev/uinput"
+        echo "  groups $DESKTOP_USER"
+        echo "  lsmod | grep uinput"
+    fi
+fi
+echo ""
+
+# Fourth, test virtual mouse creation
+echo "[TEST 4/4] Testing virtual mouse creation..."
+MOUSE_TEST=$(su - "$DESKTOP_USER" -c '
+python3 << "PYTEST"
+import sys
+try:
+    from evdev import UInput, ecodes, AbsInfo
+    
+    # Create a virtual mouse with absolute positioning
+    capabilities = {
+        ecodes.EV_KEY: [ecodes.BTN_LEFT, ecodes.BTN_RIGHT, ecodes.BTN_MIDDLE],
+        ecodes.EV_ABS: [
+            (ecodes.ABS_X, AbsInfo(0, 0, 65535, 0, 0, 0)),
+            (ecodes.ABS_Y, AbsInfo(0, 0, 65535, 0, 0, 0))
+        ]
+    }
+    
+    ui = UInput(capabilities, name="Sunshine-Test-Mouse")
+    print("SUCCESS: Created virtual mouse")
+    ui.close()
+    
+except Exception as e:
+    print(f"ERROR: {e}")
+    sys.exit(1)
+PYTEST
+' 2>&1)
+
+if echo "$MOUSE_TEST" | grep -q "SUCCESS"; then
+    echo "[SUCCESS] ✓ Virtual mouse creation WORKS!"
+else
+    echo "[WARN] Virtual mouse creation failed (keyboard may still work)"
+    echo "[ERROR] Output: $MOUSE_TEST"
+fi
+echo ""
+
+# Summary
+echo "=========================================="
+echo "  VIRTUAL DEVICE TEST SUMMARY"
+echo "=========================================="
+if echo "$TEST_RESULT" | grep -q "SUCCESS" && echo "$MOUSE_TEST" | grep -q "SUCCESS"; then
+    echo "[SUCCESS] ✓✓✓ ALL TESTS PASSED ✓✓✓"
+    echo "[SUCCESS] Sunshine WILL BE ABLE to create virtual keyboard and mouse!"
+    echo ""
+elif echo "$TEST_RESULT" | grep -q "SUCCESS"; then
+    echo "[PARTIAL] ✓ Keyboard works, but mouse may not"
+    echo "[INFO] Sunshine keyboard input should work"
+    echo ""
+else
+    echo "[FAILURE] ✗✗✗ VIRTUAL DEVICE CREATION FAILED ✗✗✗"
+    echo "[ERROR] Sunshine WILL NOT be able to create input devices"
+    echo "[ERROR] Moonlight input WILL NOT WORK"
+    echo ""
+    echo "POSSIBLE CAUSES:"
+    echo "  1. Kernel doesn't have CONFIG_INPUT_UINPUT enabled"
+    echo "  2. SELinux/AppArmor blocking uinput access"
+    echo "  3. Container/VM limitations"
+    echo "  4. Missing kernel modules"
+    echo ""
+    echo "NEXT STEPS:"
+    echo "  1. Check kernel config: zgrep CONFIG_INPUT_UINPUT /proc/config.gz"
+    echo "  2. Check SELinux: getenforce"
+    echo "  3. Check dmesg for errors: dmesg | grep uinput"
+    echo "  4. Try in a different environment (bare metal vs VM)"
+    echo ""
+    
+    # Don't exit - continue to see if Sunshine itself can work around it
+    echo "[INFO] Continuing anyway - Sunshine may have alternative input methods..."
 fi
 echo ""
 
