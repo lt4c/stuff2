@@ -24,8 +24,9 @@ VNC_BIND="0.0.0.0"                            # Bind VNC to all interfaces (0.0.
 VNC_PASSWORD="vmtest"                         # VNC password (optional)
 SKIP_DOWNLOAD=false                           # Set to true to skip download if file exists
 
-# GPU PCI address - Find with: lspci | grep NVIDIA
-GPU_PCI_ADDRESS="0001:00:00.0"               # Change this to your Tesla T4 PCI address
+# GPU PCI address - Will be auto-detected
+GPU_PCI_ADDRESS=""                            # Auto-detected from lspci
+GPU_VENDOR="NVIDIA"                           # GPU vendor to search for (NVIDIA, AMD, Intel)
 
 # VFIO device paths (will be auto-detected based on PCI address)
 VFIO_GROUP=""
@@ -56,9 +57,56 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# Install pciutils if not installed (for lspci command)
+if ! command -v lspci &> /dev/null; then
+    print_info "lspci not found. Installing pciutils..."
+    apt update
+    apt install -y pciutils
+    print_info "pciutils installed successfully"
+else
+    print_info "lspci is already available"
+fi
+
 # Check if QEMU is installed
 if ! command -v qemu-system-x86_64 &> /dev/null; then
     print_error "QEMU is not installed. Install with: apt install qemu-kvm"
+    exit 1
+fi
+
+# Auto-detect GPU PCI address
+print_info "Auto-detecting $GPU_VENDOR GPU..."
+GPU_LIST=$(lspci -nn | grep -i "$GPU_VENDOR" | grep -i "VGA\|3D\|Display")
+
+if [ -z "$GPU_LIST" ]; then
+    print_error "No $GPU_VENDOR GPU found. Available GPUs:"
+    lspci | grep -i "VGA\|3D\|Display"
+    exit 1
+fi
+
+# Count number of GPUs found
+GPU_COUNT=$(echo "$GPU_LIST" | wc -l)
+
+if [ $GPU_COUNT -eq 1 ]; then
+    # Only one GPU found, use it
+    GPU_PCI_ADDRESS=$(echo "$GPU_LIST" | awk '{print $1}' | sed 's/^/0000:/')
+    GPU_NAME=$(echo "$GPU_LIST" | cut -d':' -f3- | sed 's/^[[:space:]]*//')
+    print_info "Found GPU: $GPU_NAME"
+    print_info "PCI Address: $GPU_PCI_ADDRESS"
+else
+    # Multiple GPUs found, let user choose
+    print_info "Found $GPU_COUNT $GPU_VENDOR GPUs:"
+    echo "$GPU_LIST" | nl -w2 -s'. '
+    
+    # Auto-select first GPU (or you can add interactive selection)
+    GPU_PCI_ADDRESS=$(echo "$GPU_LIST" | head -n1 | awk '{print $1}' | sed 's/^/0000:/')
+    GPU_NAME=$(echo "$GPU_LIST" | head -n1 | cut -d':' -f3- | sed 's/^[[:space:]]*//')
+    print_info "Auto-selecting first GPU: $GPU_NAME"
+    print_info "PCI Address: $GPU_PCI_ADDRESS"
+fi
+
+# Verify PCI address format
+if [[ ! "$GPU_PCI_ADDRESS" =~ ^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$ ]]; then
+    print_error "Invalid PCI address format: $GPU_PCI_ADDRESS"
     exit 1
 fi
 
