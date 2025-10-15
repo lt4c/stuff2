@@ -21,7 +21,7 @@ MEMORY="28G"                                  # RAM allocation
 CPUS="4"                                      # CPU cores
 VNC_PORT="5900"                               # VNC port (5900 = display :0)
 VNC_BIND="0.0.0.0"                            # Bind VNC to all interfaces (0.0.0.0 for public access)
-VNC_PASSWORD="vmtest"                         # VNC password (optional)
+VNC_PASSWORD="lt4c"                         # VNC password (optional)
 SKIP_DOWNLOAD=false                           # Set to true to skip download if file exists
 
 # GPU PCI address - Will be auto-detected

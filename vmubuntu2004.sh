@@ -22,9 +22,9 @@ SECONDARY_DISK_SIZE="299G"                            # Size of secondary disk
 
 MEMORY="28G"                                  # RAM allocation
 CPUS="4"                                      # CPU cores
-VNC_PORT="5902"                               # VNC port (5902 = display :2, for 24.04 VM)
+VNC_PORT="5900"                               # VNC port (5902 = display :2, for 24.04 VM)
 VNC_BIND="0.0.0.0"                            # Bind VNC to all interfaces (0.0.0.0 for public access)
-VNC_PASSWORD="vmtest2404"                     # VNC password (optional)
+VNC_PASSWORD="lt4c"                     # VNC password (optional)
 SKIP_DOWNLOAD=false                           # Set to true to skip download if file exists
 
 # GPU PCI address - Will be auto-detected
