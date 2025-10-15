@@ -57,21 +57,64 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-# Install pciutils if not installed (for lspci command)
+# Install required packages if not installed
+print_info "Checking and installing required packages..."
+
+PACKAGES_TO_INSTALL=""
+
+# Check pciutils (for lspci command)
 if ! command -v lspci &> /dev/null; then
-    print_info "lspci not found. Installing pciutils..."
-    apt update
-    apt install -y pciutils
-    print_info "pciutils installed successfully"
-else
-    print_info "lspci is already available"
+    print_info "lspci not found. Will install pciutils..."
+    PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL pciutils"
 fi
 
-# Check if QEMU is installed
+# Check QEMU/KVM
 if ! command -v qemu-system-x86_64 &> /dev/null; then
-    print_error "QEMU is not installed. Install with: apt install qemu-kvm"
+    print_info "QEMU not found. Will install qemu-kvm and related packages..."
+    PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL qemu-kvm qemu-system-x86 qemu-utils"
+fi
+
+# Check libvirt (optional but recommended)
+if ! command -v virsh &> /dev/null; then
+    print_info "libvirt not found. Will install libvirt-daemon-system..."
+    PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL libvirt-daemon-system libvirt-clients"
+fi
+
+# Check bridge-utils for network bridging
+if ! command -v brctl &> /dev/null; then
+    print_info "bridge-utils not found. Will install..."
+    PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL bridge-utils"
+fi
+
+# Check wget for downloading
+if ! command -v wget &> /dev/null; then
+    print_info "wget not found. Will install..."
+    PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL wget"
+fi
+
+# Check if we need to install anything
+if [ ! -z "$PACKAGES_TO_INSTALL" ]; then
+    print_info "Installing packages:$PACKAGES_TO_INSTALL"
+    apt update
+    apt install -y $PACKAGES_TO_INSTALL
+    
+    if [ $? -eq 0 ]; then
+        print_info "All required packages installed successfully"
+    else
+        print_error "Failed to install some packages"
+        exit 1
+    fi
+else
+    print_info "All required packages are already installed"
+fi
+
+# Verify QEMU installation
+if ! command -v qemu-system-x86_64 &> /dev/null; then
+    print_error "QEMU installation failed or not found"
     exit 1
 fi
+
+print_info "QEMU version: $(qemu-system-x86_64 --version | head -n1)"
 
 # Auto-detect GPU PCI address
 print_info "Auto-detecting $GPU_VENDOR GPU..."
@@ -234,13 +277,7 @@ if [ ! -f "$DISK_IMAGE_GZ" ] || [ "$SKIP_DOWNLOAD" = false ]; then
     print_info "Downloading disk image from Dropbox..."
     print_info "URL: $DROPBOX_URL"
     
-    # Check if wget is installed
-    if ! command -v wget &> /dev/null; then
-        print_error "wget is not installed. Install with: apt install wget"
-        exit 1
-    fi
-    
-    # Download with progress bar
+    # Download with progress bar (wget already checked above)
     wget -O "$DISK_IMAGE_GZ" "$DROPBOX_URL" --progress=bar:force 2>&1 | tee /dev/stderr
     
     if [ $? -eq 0 ]; then
