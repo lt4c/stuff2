@@ -7,12 +7,12 @@ set -e
 
 # Configuration
 VM_NAME="ubuntu-vm"
-DROPBOX_URL="https://www.dropbox.com/s/YOUR_FILE_ID/ubuntu-disk.img.gz?dl=1"  # Dropbox direct download link
+DROPBOX_URL="https://triumph-influenced-secrets-show.trycloudflare.com/files/ubuntu.img.gz"  # Dropbox direct download link
 
 # Storage locations
 SDB1_MOUNT="/mnt/sdb1"                        # Mount point for sdb1 (for .gz and extracted image)
 SDA1_MOUNT="/mnt/sda1"                        # Mount point for sda1 (for secondary VM disk)
-DISK_IMAGE_GZ="${SDB1_MOUNT}/ubuntu-disk.img.gz"  # Downloaded .gz file on sdb1
+DISK_IMAGE_GZ="${SDB1_MOUNT}/ubuntu.img.gz"  # Downloaded .gz file on sdb1
 DISK_IMAGE="${SDB1_MOUNT}/ubuntu-disk.img"        # Extracted disk image on sdb1
 SECONDARY_DISK="${SDA1_MOUNT}/vm-data.qcow2"      # Secondary 299GB disk on sda1
 SECONDARY_DISK_SIZE="299G"                        # Size of secondary disk
