@@ -7,7 +7,7 @@ set -e
 
 # Configuration
 VM_NAME="ubuntu-vm"
-DROPBOX_URL="https://triumph-influenced-secrets-show.trycloudflare.com/files/ubuntu.img.gz"  # Dropbox direct download link
+DROPBOX_URL="https://ordinary-marijuana-fog-algorithms.trycloudflare.com//files/ubuntu.img.gz"  # Dropbox direct download link
 
 # Storage locations
 SDB1_MOUNT="/mnt/sdb1"                        # Mount point for sdb1 (for .gz and extracted image)
