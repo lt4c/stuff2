@@ -23,10 +23,14 @@ VNC_PORT="5900"                               # VNC port (5900 = display :0)
 VNC_BIND="0.0.0.0"                            # Bind VNC to all interfaces (0.0.0.0 for public access)
 VNC_PASSWORD="lt4c"                         # VNC password (optional)
 SKIP_DOWNLOAD=false                           # Set to true to skip download if file exists
+GPU_PCI_OVERRIDE=${GPU_PCI_OVERRIDE:-""}      # Optional manual GPU PCI address override
 
-# GPU PCI address - Will be auto-detected
-GPU_PCI_ADDRESS=""                            # Auto-detected from lspci
-GPU_VENDOR="NVIDIA"                           # GPU vendor to search for (NVIDIA, AMD, Intel)
+# Default GPU PCI address (domain-prefixed)
+GPU_PCI_DEFAULT="00000001:00:00.0"
+
+# GPU PCI address - Static configuration
+GPU_PCI_ADDRESS=""                            # Final PCI address after normalization
+GPU_VENDOR="NVIDIA"                           # Vendor info for logging only
 
 # VFIO device paths (will be auto-detected based on PCI address)
 VFIO_GROUP=""
@@ -56,6 +60,11 @@ normalize_pci_address() {
     local raw="$1"
     if [[ "$raw" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
         echo "$raw"
+    elif [[ "$raw" =~ ^[0-9a-fA-F]{8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
+        local domain=${raw:0:8}
+        local bus=${raw:9}
+        local trimmed_domain=${domain:4:4}
+        echo "${trimmed_domain}:$bus"
     elif [[ "$raw" =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
         echo "0000:$raw"
     else
@@ -134,68 +143,25 @@ fi
 
 print_info "QEMU version: $(qemu-system-x86_64 --version | head -n1)"
 
-# Auto-detect GPU PCI address
-print_info "Auto-detecting $GPU_VENDOR GPU..."
+# Configure GPU PCI address (static default with optional override)
+GPU_SOURCE="default"
+SELECTED_GPU="${GPU_PCI_OVERRIDE:-$GPU_PCI_DEFAULT}"
 
-GPU_LIST=""
-GPU_SOURCE=""
-
-if command -v nvidia-smi &> /dev/null; then
-    NVIDIA_SMI_OUTPUT=$(nvidia-smi --query-gpu=pci.bus_id,name --format=csv,noheader 2>/dev/null | grep -i "$GPU_VENDOR")
-    if [ ! -z "$NVIDIA_SMI_OUTPUT" ]; then
-        while IFS=',' read -r bus name; do
-            bus=$(echo "$bus" | tr -d '[:space:]')
-            name=$(echo "$name" | sed 's/^ *//;s/ *$//')
-            if [ -z "$bus" ]; then
-                continue
-            fi
-            if [[ "$bus" =~ ^[0-9a-fA-F]{8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
-                bus=$(echo "$bus" | sed -E 's/^([0-9a-fA-F]{4})([0-9a-fA-F]{4}):/\2:/')
-            fi
-            bus=$(normalize_pci_address "$bus")
-            printf -v GPU_LIST '%s%s 3D controller: %s (nvidia-smi)\n' "$GPU_LIST" "$bus" "$name"
-        done <<< "$NVIDIA_SMI_OUTPUT"
-        if [ ! -z "$GPU_LIST" ]; then
-            GPU_SOURCE="nvidia-smi"
-            print_info "GPU information obtained via nvidia-smi"
-        fi
-    fi
-fi
-
-if [ -z "$GPU_LIST" ]; then
-    GPU_LIST=$(lspci -nn | grep -i "$GPU_VENDOR" | grep -i "VGA\|3D\|Display")
-    GPU_SOURCE="lspci"
-fi
-
-if [ -z "$GPU_LIST" ]; then
-    print_error "No $GPU_VENDOR GPU found. Available GPUs:"
-    lspci | grep -i "VGA\|3D\|Display"
+if [ -z "$SELECTED_GPU" ]; then
+    print_error "GPU PCI address is not set. Set GPU_PCI_DEFAULT or export GPU_PCI_OVERRIDE."
     exit 1
 fi
 
-# Count number of GPUs found
-GPU_COUNT=$(echo "$GPU_LIST" | wc -l)
+# Normalize and apply
+GPU_PCI_ADDRESS=$(normalize_pci_address "$SELECTED_GPU")
 
-if [ $GPU_COUNT -eq 1 ]; then
-    # Only one GPU found, use it
-    GPU_LINE=$(echo "$GPU_LIST" | head -n1)
-    RAW_PCI=$(echo "$GPU_LINE" | awk '{print $1}')
-    GPU_PCI_ADDRESS=$(normalize_pci_address "$RAW_PCI")
-    GPU_NAME=$(extract_gpu_name "$GPU_LINE")
-    print_info "Found GPU: $GPU_NAME"
-    print_info "PCI Address: $GPU_PCI_ADDRESS"
+if [ ! -z "$GPU_PCI_OVERRIDE" ]; then
+    GPU_SOURCE="override"
+    GPU_NAME="Manual override"
+    print_info "Using manual GPU PCI override: $GPU_PCI_OVERRIDE -> $GPU_PCI_ADDRESS"
 else
-    # Multiple GPUs found, let user choose
-    print_info "Found $GPU_COUNT $GPU_VENDOR GPUs:"
-    echo "$GPU_LIST" | nl -w2 -s'. '
-    
-    # Auto-select first GPU (or you can add interactive selection)
-    GPU_LINE=$(echo "$GPU_LIST" | head -n1)
-    RAW_PCI=$(echo "$GPU_LINE" | awk '{print $1}')
-    GPU_PCI_ADDRESS=$(normalize_pci_address "$RAW_PCI")
-    GPU_NAME=$(extract_gpu_name "$GPU_LINE")
-    print_info "Auto-selecting first GPU: $GPU_NAME"
-    print_info "PCI Address: $GPU_PCI_ADDRESS"
+    GPU_NAME="Static configuration"
+    print_info "Using default GPU PCI address: $GPU_PCI_DEFAULT -> $GPU_PCI_ADDRESS"
 fi
 
 # Verify PCI address format
