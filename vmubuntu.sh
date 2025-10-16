@@ -13,7 +13,7 @@ DROPBOX_URL="https://triumph-influenced-secrets-show.trycloudflare.com/files/ubu
 SDB1_MOUNT="/mnt/sdb1"                        # Mount point for sdb1 (for .gz and extracted image)
 SDA1_MOUNT="/mnt/sda1"                        # Mount point for sda1 (for secondary VM disk)
 DISK_IMAGE_GZ="${SDB1_MOUNT}/ubuntu.img.gz"  # Downloaded .gz file on sdb1
-DISK_IMAGE="${SDB1_MOUNT}/ubuntu-disk.img"        # Extracted disk image on sdb1
+DISK_IMAGE="${SDB1_MOUNT}/ubuntu.img"        # Extracted disk image on sdb1
 SECONDARY_DISK="${SDA1_MOUNT}/vm-data.qcow2"      # Secondary 299GB disk on sda1
 SECONDARY_DISK_SIZE="299G"                        # Size of secondary disk
 
@@ -49,6 +49,24 @@ print_warn() {
 
 print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
+}
+
+# Normalize PCI address to include domain (0000:) when missing
+normalize_pci_address() {
+    local raw="$1"
+    if [[ "$raw" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
+        echo "$raw"
+    elif [[ "$raw" =~ ^[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
+        echo "0000:$raw"
+    else
+        echo "$raw"
+    fi
+}
+
+# Extract human readable GPU name from lspci line
+extract_gpu_name() {
+    local line="$1"
+    echo "$line" | sed 's/^[^ ]\+  *//'
 }
 
 # Check if running as root
@@ -118,7 +136,36 @@ print_info "QEMU version: $(qemu-system-x86_64 --version | head -n1)"
 
 # Auto-detect GPU PCI address
 print_info "Auto-detecting $GPU_VENDOR GPU..."
-GPU_LIST=$(lspci -nn | grep -i "$GPU_VENDOR" | grep -i "VGA\|3D\|Display")
+
+GPU_LIST=""
+GPU_SOURCE=""
+
+if command -v nvidia-smi &> /dev/null; then
+    NVIDIA_SMI_OUTPUT=$(nvidia-smi --query-gpu=pci.bus_id,name --format=csv,noheader 2>/dev/null | grep -i "$GPU_VENDOR")
+    if [ ! -z "$NVIDIA_SMI_OUTPUT" ]; then
+        while IFS=',' read -r bus name; do
+            bus=$(echo "$bus" | tr -d '[:space:]')
+            name=$(echo "$name" | sed 's/^ *//;s/ *$//')
+            if [ -z "$bus" ]; then
+                continue
+            fi
+            if [[ "$bus" =~ ^[0-9a-fA-F]{8}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
+                bus=$(echo "$bus" | sed -E 's/^([0-9a-fA-F]{4})([0-9a-fA-F]{4}):/\2:/')
+            fi
+            bus=$(normalize_pci_address "$bus")
+            printf -v GPU_LIST '%s%s 3D controller: %s (nvidia-smi)\n' "$GPU_LIST" "$bus" "$name"
+        done <<< "$NVIDIA_SMI_OUTPUT"
+        if [ ! -z "$GPU_LIST" ]; then
+            GPU_SOURCE="nvidia-smi"
+            print_info "GPU information obtained via nvidia-smi"
+        fi
+    fi
+fi
+
+if [ -z "$GPU_LIST" ]; then
+    GPU_LIST=$(lspci -nn | grep -i "$GPU_VENDOR" | grep -i "VGA\|3D\|Display")
+    GPU_SOURCE="lspci"
+fi
 
 if [ -z "$GPU_LIST" ]; then
     print_error "No $GPU_VENDOR GPU found. Available GPUs:"
@@ -131,8 +178,10 @@ GPU_COUNT=$(echo "$GPU_LIST" | wc -l)
 
 if [ $GPU_COUNT -eq 1 ]; then
     # Only one GPU found, use it
-    GPU_PCI_ADDRESS=$(echo "$GPU_LIST" | awk '{print $1}' | sed 's/^/0000:/')
-    GPU_NAME=$(echo "$GPU_LIST" | cut -d':' -f3- | sed 's/^[[:space:]]*//')
+    GPU_LINE=$(echo "$GPU_LIST" | head -n1)
+    RAW_PCI=$(echo "$GPU_LINE" | awk '{print $1}')
+    GPU_PCI_ADDRESS=$(normalize_pci_address "$RAW_PCI")
+    GPU_NAME=$(extract_gpu_name "$GPU_LINE")
     print_info "Found GPU: $GPU_NAME"
     print_info "PCI Address: $GPU_PCI_ADDRESS"
 else
@@ -141,8 +190,10 @@ else
     echo "$GPU_LIST" | nl -w2 -s'. '
     
     # Auto-select first GPU (or you can add interactive selection)
-    GPU_PCI_ADDRESS=$(echo "$GPU_LIST" | head -n1 | awk '{print $1}' | sed 's/^/0000:/')
-    GPU_NAME=$(echo "$GPU_LIST" | head -n1 | cut -d':' -f3- | sed 's/^[[:space:]]*//')
+    GPU_LINE=$(echo "$GPU_LIST" | head -n1)
+    RAW_PCI=$(echo "$GPU_LINE" | awk '{print $1}')
+    GPU_PCI_ADDRESS=$(normalize_pci_address "$RAW_PCI")
+    GPU_NAME=$(extract_gpu_name "$GPU_LINE")
     print_info "Auto-selecting first GPU: $GPU_NAME"
     print_info "PCI Address: $GPU_PCI_ADDRESS"
 fi
